@@ -72,6 +72,15 @@ Pour obtenir une précision maximale à la grille de cuisson :
 3. Ajustez l'élément `offset` sous le bloc `calibrate_linear` de votre fichier de configuration pour corriger d'éventuels écarts fixes.
 
 ---
+## 🔒 Pourquoi ce projet est-il archivé (en Lecture Seule) ?
+
+**Note à la communauté :** 
+Ce dépôt est volontairement configuré en mode archivé (Lecture seule). Ce choix a été fait uniquement pour **protéger mon temps libre** et m'éviter la gestion quotidienne des demandes de support personnalisé, des questions techniques ou des demandes d'adaptation à d'autres modèles de barbecues. 
+
+* **Le projet n'est pas abandonné :** Il est parfaitement fonctionnel et tourne quotidiennement chez moi. 
+* **Mises à jour futures :** Si j'apporte des améliorations majeures ou des corrections à mon système à l'avenir, je désarchiverai temporairement ce dépôt le temps de téléverser les nouveaux fichiers, avant de le verrouiller à nouveau.
+
+Merci de respecter cette démarche et de profiter librement de ce partage pour vos propres créations !
 
 ## ⚖️ Licence
 
