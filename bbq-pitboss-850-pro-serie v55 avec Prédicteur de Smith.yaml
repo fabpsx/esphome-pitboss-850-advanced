@@ -1,0 +1,3864 @@
+substitutions:
+  #node_name: "bbq-pitboss-pro-serie-850"
+  node_name: !secret node_name
+  # Couleurs background
+  color_bg: "0xD2D2D2"            # Gris très pâle
+  color_bg_obj: "0xA7A7A7"        # Gris pâle
+  color_bg_obj2: "0x919191"       # Gris moyen
+  # Colors common
+  color_black: "0x000000"         # Noir
+  color_white: "0xFFFFFF"         # Blanc             inutilisé
+  color_grey: "0xa5a5a5"          # Gris
+  color_grey_moy: "0x7F7F7F"      # Gris moyen
+  color_dark_grey: "0x282828"     # Gris foncé        inutilisé
+  color_darker_grey: "0x212121"   # Gris très foncé   inutilisé
+  color_light_grey: "0x444444"    # Gris pâle         inutilisé
+  color_accent: "0x18bcf2"        # Cyan              inutilisé
+  color_warning: "0xd2691e"       # Orange foncé      inutilisé
+  color_success: "0x7fff00"       # Vert Fluorescent  inutilisé
+  # Mode colors
+  color_pv: "0x000082"            # Bleu marin
+  color_on: "0x006800"            # Vert foncé
+  color_auto: "0x2fd1c5"          # Vert Aqua         inutilisé
+  color_cool: "0x00bfff"          # Bleu pâle         inutilisé
+  color_heat: "0xff7f00"          # Orange
+  color_off: "0x868686"           # Gris pâle
+  color_dry: "0xff8c00"           # Orange            inutilisé
+  color_fan: "0x87ceeb"           # Cyan pâle         inutilisé
+  # More colors
+  Silver_sand: "0xc0c4c5"         # Fond gris pale pour object rectangle à bord arrondi     inutilisé
+  # Temperature colors
+  color_temp_current: "0x35ffe6"  # Vert menthe       inutilisé
+  color_temp_set: "0x51a0e4"      # Bleu Marin pâle   inutilisé
+  color_temp_ticks: "0x585858"    # Gris moyen        inutilisé
+  # Material Design Icons
+  mdi_chevron_up: "\U000F0143"    # Pour indiquer le sens d'ouverture des Dropdown lvgl
+  mdi_chevron_down: "\U000F0140"  # Pour indiquer le sens d'ouverture des Dropdown lvgl
+
+
+esphome:
+  name: ${node_name}
+  friendly_name: "BBQ_PitBoss_Pro_850"
+  comment: "Cntrl de temp. optimisé BBQ Pitboss 850 Pro Series"
+  
+  build_flags:
+    - "-DBOARD_HAS_PSRAM"
+
+  on_boot:
+    - priority: 800  # On commence très tôt pour fixer le matériel
+      then:
+        # 1. Stabilisation immédiate du rétroéclairage (Registre 0x02)
+        - lambda: |-
+            // On force le registre de mode de la puce CH32 (Registre 0x02)
+            // pour s'assurer qu'elle est bien en mode PWM et non en flottement
+            uint8_t init_mode[] = {0x02, 0x02}; 
+            id(bus_a).write(0x24, init_mode, 2);
+          
+            // On force une valeur de sécurité (éteint en inversé)
+            uint8_t init_off[] = {0x05, 255};
+            id(bus_a).write(0x24, init_off, 2);
+
+        - delay: 1s # <--- Ajoute une pause pour laisser le GT911 se réveiller proprement
+
+        # 2. Allumage contrôlé
+        - light.turn_on:
+            id: lcd_backlight
+            brightness: 100%
+
+        # 3. Paramétrage des composants logiciels    
+        - switch.turn_off: switch_antiburn
+          # Initialisation du thermostat
+        - climate.control:
+            id: bbq_pid
+            mode: "OFF"
+            target_temperature: 180
+
+        # 4. Remise à zéro des variables
+        - globals.set: {id: is_igniting, value: 'false'}
+        - globals.set: {id: is_cooling, value: 'false'}
+        - globals.set: {id: smoke_mode_active, value: 'false'}
+          # Aucune fautes au boot
+        - binary_sensor.template.publish: { id: err_allumage, state: OFF }
+        - binary_sensor.template.publish: { id: err_surchauffe, state: OFF }
+        - binary_sensor.template.publish: { id: err_sonde_cuve, state: OFF }
+
+        # 5. Ajustement des paramètres du Climate PID selon valeurs défini dans la variables globales
+          # Délai de 5s avant ajustement des variables globales du PID
+        - delay: 5s 
+          # Synchronise les paramètres pid au paramètre pid définis dans les globals
+        - lambda: |-
+            // Synchronise les curseurs HA avec les valeurs de tes globales au démarrage
+            id(tuner_kp).publish_state(id(base_kp));
+            id(tuner_ki).publish_state(id(base_ki));
+            id(tuner_kd).publish_state(id(base_kd));
+          # Délai de 500ms avant déverrouillage du PID
+        - delay: 500ms
+        - lambda: |-
+            // 3. On ouvre le verrou : maintenant les changements manuels dans HA seront acceptés
+            id(pid_sync_ready) = true;
+            ESP_LOGI("boot", "Verrou PID levé, synchro terminée.");
+
+        # --- Activation du Prédicteur de Smith au démarrage ---
+        # S'exécute après pid_sync_ready pour que les gains soient prêts.
+        # Si smith_active est restauré à true (restore_value: yes), on force
+        # la neutralisation du PID natif immédiatement.
+        - lambda: |-
+            if (id(smith_active)) {
+                // Neutralisation du PID natif si Prédicteur de Smith actif
+                auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+                pid_c->set_kp(0.0f);
+                pid_c->set_ki(0.0f);
+                pid_c->set_kd(0.0f);
+                id(pid_integral)   = 0.0f;
+                id(pid_last_error) = 0.0f;
+                id(pid_last_temp)  = 0.0f;
+                id(pid_last_time)  = 0;
+                ESP_LOGI("SMITH", "Boot : Prédicteur de Smith actif — PID natif neutralisé");
+            } else {
+                ESP_LOGI("SMITH", "Boot : Mode PID natif actif");
+            }
+
+    # ------------------------------------------------------------------
+    # Détection "API absente au démarrage" (cas typique d'une panne de
+    # courant générale où le panneau termine son boot avant HA).
+    # Si l'API n'est toujours pas connectée 20s après le boot, on lève
+    # un drapeau. Dès que l'API se connecte enfin (voir api.on_client_connected
+    # plus bas), on force UN redémarrage logiciel du panneau, dans
+    # l'espoir de reproduire les conditions d'une réparation manuelle
+    # (reboot alors que HA est déjà disponible).
+    # ------------------------------------------------------------------
+    - priority: -100  # Tardif, après que tous les composants soient configurés
+      then:
+        - delay: 20s
+        - if:
+            condition:
+              not:
+                api.connected:
+            then:
+              - logger.log: "API absente 20s après le boot, drapeau levé pour reboot différé"
+              - globals.set:
+                  id: api_was_absent_at_boot
+                  value: "true"
+
+# --- INFRASTRUCTURE WAVESHARE ET CAPTEUR VL6180x---
+external_components:
+  - source: github://pr#10071
+    components: [waveshare_io_ch32v003]
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_FREERTOS_HZ: "1000"
+      CONFIG_SPIRAM_MODE_OCT: y
+      CONFIG_IDF_EXPERIMENTAL_FEATURES: y
+      CONFIG_SPIRAM_SPEED_120M: y
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: y
+      CONFIG_COMPILER_OPTIMIZATION_PERF: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# Active le log
+logger:
+# Par défaut le log est en level: DEBUG donc complet, activer une des ligne suivante pour obtenir moins de log
+  #level: INFO
+  #level: WARN
+  #level: ERROR
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 0s  # Désactive le reboot automatique en cas de perte de connexion
+  encryption:
+    key: !secret api_encryption_key
+  on_client_connected:
+    then:
+      - if:
+          condition:
+            lambda: "return id(api_was_absent_at_boot);"
+          then:
+            - logger.log: "Première connexion API après absence au boot -> reboot du panneau dans 5s"
+            # On remet le drapeau à faux immédiatement pour éviter toute
+            # boucle de reboot si l'API se déconnecte/reconnecte ensuite
+            # avant le redémarrage effectif.
+            - globals.set:
+                id: api_was_absent_at_boot
+                value: "false"
+            - delay: 5s
+            - button.press: panel_reboot_on_late_api
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  fast_connect: true
+  use_address: 192.168.0.10
+  manual_ip:
+    static_ip: 192.168.0.10
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+  min_auth_mode: WPA2 
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Bbq-Pitboss-850-Pro-Serie"
+    password: !secret fallback_password
+
+captive_portal:
+
+# Serveur Web
+web_server:
+  port: 80
+#  ota: False # Si activé, ne permet pas de mise à jour via le serveur Web
+#  include_internal: True # Si activé, affiche les valeurs des senseurs internes
+
+waveshare_io_ch32v003:
+  - id: waveshare_io_hub
+    address: 0x24
+
+#-------------------------------------------
+# Paramètre du Bus I2C
+#-------------------------------------------
+i2c:
+  - id: bus_a
+    sda: 8
+    scl: 9
+    scan: false
+    frequency: 50kHz # Fréquence recommandée pour l'AHT20 et l'écran tactile
+    timeout: 50ms # <--- Ajoutez ceci pour donner de la marge aux modules lents
+#------------------------------------------------------------------------------
+# Bus UART2 — Capteur ultrason Étanche DFRobot A02YYUW pour niveau de la Trémie
+#------------------------------------------------------------------------------
+uart:
+  - id: uart_tremie
+    tx_pin: 43   # TX de la carte → RX du DFRobot A02YYUW
+    rx_pin: 44   # RX de la carte ← TX du DFRobot A02YYUW
+    baud_rate: 9600
+
+#-------------------------------------------
+# Carte extension IO Discret MCP23017
+#-------------------------------------------
+mcp23017:
+  - id: mcp_hub
+    address: 0x20  # Adresse par défaut (A0, A1, A2 au GND)
+
+#-------------------------------------------
+# Carte extension Entrées analogique ADS1115
+#-------------------------------------------
+ads1115:
+  - address: 0x48
+    id: ads_hub
+
+#-------------------------------------------
+# Sortie analogue
+#-------------------------------------------
+output:
+# Rétro-éclairage
+  - platform: waveshare_io_ch32v003
+    id: backlight_pwm_output
+    waveshare_io_ch32v003_id: waveshare_io_hub
+    inverted: true
+    min_power: 0.07
+    max_power: 1.00
+
+# Sortie du PID PWM lente cycle de 30 sec.
+  - platform: slow_pwm
+    id: auger_slow_pwm
+    pin: 6 # La pin GP6 de ton connecteur
+    period: 20s # Cycle de 15 secondes
+    # Ajoute ces deux lignes ici :
+    min_power: 0.0    # Équivalent à 0%
+    max_power: 1.0    # Équivalent à 100%
+
+# --- 2 sorties virtuel pour le PID et le Prédicteur de Smith   ---
+# --- Permet de les traiter dans le script de routing           ---
+# --- avant de les envoyer à la sortie physique (auger_slow_pwm)---
+# Sortie virtuelle pour le PID (ne touche pas la pin physique)
+  - platform: template
+    id: pid_out
+    type: float
+    write_action:
+      - lambda: |-
+          // On publie la valeur brute 'state' vers le lisseur
+          id(pid_output_lisse).publish_state(state);
+
+# Sortie virtuelle pour le Prédicteur de Smith (ne touche pas la pin physique)
+  - platform: template
+    id: smith_out
+    type: float
+    write_action:
+      - lambda: |-
+          // Borne AVANT le filtre EMA pour éviter que l'EMA
+          // lisse vers des valeurs sous le plancher physique de 10%
+          float val_bornee = state;
+          //if (val_bornee < 0.10f) val_bornee = 0.10f;
+          //if (val_bornee > 0.50f) val_bornee = 0.50f;
+          if (val_bornee < id(pid_sortie_min)) val_bornee = id(pid_sortie_min);
+          if (val_bornee > id(pid_sortie_max)) val_bornee = id(pid_sortie_max);
+          id(smith_output_lisse).publish_state(val_bornee);
+
+light:
+  - platform: monochromatic
+    id: lcd_backlight
+    name: "Luminosité Écran"
+    output: backlight_pwm_output
+    restore_mode: ALWAYS_ON
+    default_transition_length: 200ms
+    on_turn_on:
+      then:
+        - switch.turn_on: backlight_enable
+        - script.execute: stop_antiburn
+    on_turn_off:
+      then:
+        - switch.turn_off: backlight_enable
+        - script.execute: start_antiburn_temporise
+
+#-------------------------------------------
+# Entrée analogue
+#-------------------------------------------
+sensor:
+  # Température interne du processeur
+  - platform: internal_temperature
+    name: "Température Interne ESP32-S3"
+
+  # --- Sonde de température et humidité extérieur ---
+  - platform: aht10
+    variant: AHT20
+    address: 0x38
+    update_interval: 61.5s
+    temperature:
+      name: "Temp_Exterieur"
+      id: temp_ext
+      accuracy_decimals: 1
+      on_value:
+        then:
+          - lvgl.label.update: # Ajuste indicateur de température extérieur
+              id: temperature_ext
+              text:
+                format: "%.1f°C"
+                args: [ 'x' ]
+    humidity:
+      name: "Humidite_Exterieur"
+      id: hum_ext
+      accuracy_decimals: 0
+      on_value:
+        then:
+          - lvgl.label.update: # Ajuste indicateur d'humidité extérieur
+              id: humidite_ext
+              text:
+                format: "%.0f%%"
+                args: [ 'x' ]
+
+  # Nouveau capteur Ultrasonique A02YYUW pour niveau de la Trémie
+  - platform: a02yyuw
+    uart_id: uart_tremie
+    name: "Trémie Dist.RAW (mm)"
+    id: granules_mm
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_granules_mm
+            text:
+              format: "Capteur Trémie: %.1f mm"
+              args: [ 'x' ]
+    filters:
+      - filter_out: nan
+
+      # 1. Median large — prend la valeur centrale et ignore les extrêmes
+      # Élimine autant les pics vers le haut que vers le bas
+      - median:
+          window_size: 30
+          send_every: 1
+
+      # 2. EMA très doux pour suivre la tendance lente
+      # À 0.02 : ~50 lectures pour atteindre 63% d'un vrai changement
+      # Ce qui correspond à plusieurs minutes — parfait pour un niveau de trémie
+      - exponential_moving_average:
+          alpha: 0.01
+          send_every: 1
+
+  # Logique de calcul en % du niveau de la Trémie
+  - platform: template
+    name: "Trémie Niveau Granules"
+    id: niveau_granules
+    unit_of_measurement: "%"
+    icon: "mdi:archive-arrow-down-outline"
+    update_interval: 10s
+    lambda: |-
+      // --- 1. VERIFICATIONS INITIALES ---
+      const float DIST_ZONE_MORTE = 35.0;  // Distance mesurée quand trémie pleine
+      if (id(porte_tremie).state) return id(niveau_granules).state; // Si la porte est ouverte gèle la valeur
+      float x_mm = id(granules_mm).state;
+      if (std::isnan(x_mm) || x_mm < DIST_ZONE_MORTE) return 100.0; // Si capteur trop près des granules en 100%
+
+      // --- 2. PARAMETRES DE LA TREMIE (en cm) ---
+      // Modifier ces valeurs selon vos mesures réelles
+      const float L_HAUT = 37.0;     // Longueur sommet
+      const float l_HAUT = 26.0;     // Largeur sommet
+      const float L_BAS  = 16.0;     // Longueur base
+      const float l_BAS  = 10.0;     // Largeur base
+      const float H_HAUTE = 8.0;     // Hauteur de la partie droite (cube) 2cm du couvercle
+      const float H_BASSE = 10.0;    // Hauteur de la partie inclinée (tronc)
+      
+      // Calibration du capteur (en mm)
+      // Distance totale capteur -> fond (3.5 zone morte + 4.5 mesurable + 10.0 cône)
+      const float DIST_VIDE  = 180.0; // Distance mesurée quand trémie vide
+
+      // --- 3. CALCULS DES VOLUMES DE RÉFÉRENCE (en cm3) ---
+      // Aire du haut, du bas et de la partie droite
+      float aire_haut = L_HAUT * l_HAUT;
+      float aire_bas  = L_BAS * l_BAS;
+
+      // Volume du tronc de pyramide (V = h/3 * (A1 + A2 + sqrt(A1*A2)))
+      float vol_partie_basse = (H_BASSE / 3.0) * (aire_haut + aire_bas + sqrt(aire_haut * aire_bas));
+      // Volume de la partie haute = (aire_haut * H_HAUTE)
+      float vol_partie_haute = aire_haut * H_HAUTE;
+      // Volume total
+      float vol_total = vol_partie_haute + vol_partie_basse;
+
+      // --- 4. LOGIQUE DE CALCUL DU NIVEAU ---
+      // h_matiere_cm représente la hauteur de granules depuis le fond (0 à 18cm)
+      float h_matiere_cm = (DIST_VIDE - x_mm) / 10.0;
+
+      // Sécurité bornes
+      if (h_matiere_cm >= (H_HAUTE + H_BASSE)) return 100.0;
+      if (h_matiere_cm <= 0) return 0.0;
+
+      float vol_actuel = 0.0;
+
+      // CAS B : Les granules sont dans la partie inclinée (Bas)
+      if (h_matiere_cm <= H_BASSE) {
+        // --- On est dans la partie basse (Tronc de pyramide) ---
+        float ratio = h_matiere_cm / H_BASSE;
+        float L_actuel = L_BAS + (L_HAUT - L_BAS) * ratio;
+        float l_actuel = l_BAS + (l_HAUT - l_BAS) * ratio;
+        float aire_actuelle = L_actuel * l_actuel;
+        vol_actuel = (h_matiere_cm / 3.0) * (aire_actuelle + aire_bas + sqrt(aire_actuelle * aire_bas));
+      } 
+      // CAS A : Les granules sont dans la partie droite (Haut)
+      else {
+        // --- On est dans la partie haute (Base pleine + surplus rectangulaire) ---
+        float h_dans_partie_haute = h_matiere_cm - H_BASSE;
+        vol_actuel = vol_partie_basse + (aire_haut * h_dans_partie_haute);
+      }
+
+      // --- 5. RÉSULTAT ---
+      return (vol_actuel / vol_total) * 100.0;
+
+    on_value:
+      then:
+        # 1. On met à jour le texte de la valeur de niveau
+        - lvgl.label.update:
+            id: lbl_text_pct_niveau_granules
+            text: !lambda 'return str_sprintf("%.0f %%", x);'
+        # 2. On met à jour la barre indicatrice
+        - lvgl.bar.update:
+            id: niveau_tremie_bar
+            value: !lambda "return (int)x;"
+
+    # --- Gestion de l'alerte visuelle (Orange si < 10%, Gris si > 15%) ---
+#    on_value_range:
+      # Seuil d'alerte : passe à l'Orange si le niveau descend sous 15%
+#      - below: 10.0
+#        then:
+#          - lvgl.obj.update:
+#              id: main_page
+#              bg_color: 0xFF9800 # Orange
+#          - logger.log: "Alerte : Niveau de granules faible !"
+
+      # Seuil de rétablissement : revient au Gris si le niveau remonte au-dessus de 25%
+#      - above: 15.0
+#        then:
+#          - lvgl.obj.update:
+#              id: main_page
+#              bg_color: ${color_bg} # Retour au Gris pâle
+#          - logger.log: "Niveau de granules OK."
+
+
+  # --- SONDE DE TEMPÉRATURE D'ORIGINE DU BBQ (Sur A0) ---
+  - platform: ads1115
+    multiplexer: 'A0_GND' # Typiquement A0 pour la cuve
+    gain: 2.048           # Gain idéal 2.048 pour une PT1000 avec résistance 1k
+    id: bbq_chamber_voltage
+    name: "Voltage sonde BBQ"
+    update_interval: 5s
+    # Affichage sur page de diagnostique
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_volt_sonde_bbq
+            text:
+              format: "Volt Sonde BBQ: %.1f V"
+              args: [ 'x' ]
+
+# --- CAPTEUR DE RÉSISTANCE (La valeur brute en Ohms) ---
+  - platform: resistance
+    id: bbq_temp_res
+    sensor: bbq_chamber_voltage
+    configuration: DOWNSTREAM
+    resistor: 2170Ohm      # Correction par rapport à 2200 Ohms
+    name: "Résistance Sonde BBQ"
+    unit_of_measurement: "Ω"
+    accuracy_decimals: 1
+    # Affichage sur page de diagnostique
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_res_sonde_bbq
+            text:
+              format: "Rés. Sonde BBQ: %.1f Ω"
+              args: [ 'x' ]
+
+  - platform: copy
+    source_id: bbq_temp_res
+    id: bbq_temp_pv
+    name: "Temp Cuve BBQ °F"
+    # l'unité de mesure est mise en °C pour forcer HA à ne pas convertir, cela fais que 180 °F dans ESPHome donne 180 °C dans HA
+    unit_of_measurement: "°C" 
+    device_class: "temperature" # Dis à HA que c'est une température
+    state_class: "measurement"  # Dis à HA que c'est une mesure
+    accuracy_decimals: 1 # Pas besoin de décimales pour la cuve, c'est plus lisible
+    filters:
+
+# Cette calibration est la calibration standard pour une sonde de type PT1000
+#      - calibrate_linear:
+#          # Valeurs standards PT1000 (très précises pour la cuve)
+#          - 1000.0 -> 32.0   # 0°C
+#          - 1144.1 -> 100.0  # 37.8°C (Début Zone de fumage)
+#          - 1285.8 -> 170.0  # 76.7°C (Fin Zone de fumage)
+#          - 1385.1 -> 212.0  # 100°C (Point d'ébullition pour test)
+#          - 1572.0 -> 300.0  # 148.9°C (Zone de cuisson)
+#          - 1758.6 -> 400.0  # 204.4°C (Rôtissage)
+#          - 1957.5 -> 500.0  # 260.0°C (Saisissage)
+#          - 2165.2 -> 600.0  # 315.5°C (Nettoyage/Max BBQ)
+
+      # Courbe de calibration corrigé en fonction de la température réel au niveau de la grille
+      # Le but est de corriger pour avoir la bonne température de cuisson au niveau de la grille
+      - calibrate_linear:
+          - 1000.0 -> 25.1   # 0°C
+          - 1144.1 -> 105.5  # 37.8°C (Début Zone de fumage)
+          - 1285.8 -> 188.3  # 76.7°C (Fin Zone de fumage)
+          - 1385.1 -> 238.0  # 100°C (Point d'ébullition pour test)
+          - 1572.0 -> 342.0  # 148.9°C (Zone de cuisson)
+          - 1758.6 -> 460.3  # 204.4°C (Rôtissage)
+          - 1957.5 -> 578.5  # 260.0°C (Saisissage)
+          - 2165.2 -> 696.7  # 315.5°C (Nettoyage/Max BBQ)
+
+      - offset: 0.0 # Si besoin de faire un petit calibrage de correction en °F
+
+      # On lisse la température obtenue
+      - median:
+          window_size: 5 # On passe à 5 pour être plus robuste
+          send_every: 1
+
+      # 2. On ajoute le filtre de 1er ordre pour lisser la tendance
+      - exponential_moving_average:
+          alpha: 0.075 # Plus c'est petit, plus c'est lisse. 0.1 est un excellent compromis.
+          send_every: 1
+
+  # --- SONDE Aliment 1 (Sur A1) ---
+  - platform: ads1115
+    multiplexer: 'A1_GND'
+    gain: 2.048
+    id: meat_1_voltage
+    name: "Voltage sonde 1"
+    update_interval: 2.3s
+    # Affichage sur page de diagnostique
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_volt_sonde_1
+            text:
+              format: "Volt Sonde 1: %.1f V"
+              args: [ 'x' ]
+
+# --- CAPTEUR DE RÉSISTANCE (La valeur brute en Ohms) ---
+  - platform: resistance
+    id: meat_1_res
+    sensor: meat_1_voltage
+    configuration: DOWNSTREAM
+    resistor: 2135Ohm # Correction avec valeur réel de la 2200 Ohms
+    name: "Résistance Sonde 1"
+    unit_of_measurement: "Ω"
+    accuracy_decimals: 1
+    # Affichage sur page de diagnostique
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_res_sonde_1
+            text:
+              format: "Rés. Sonde 1: %.1f Ω"
+              args: [ 'x' ]
+
+# --- CAPTEUR DE TEMPÉRATURE (Calibré à partir de la résistance) ---
+  - platform: copy
+    source_id: meat_1_res
+    id: meat_1
+    name: "Temp. Sonde Aliment 1"
+    unit_of_measurement: "°F"
+    device_class: "temperature" # Dis à HA que c'est une température
+    state_class: "measurement"  # Dis à HA que c'est une mesure
+    accuracy_decimals: 1
+    filters:
+      # On convertit d'abord (très important)
+      - calibrate_linear: # Sonde RTD PT1000
+          # Valeurs standards PT1000 (très précises dans le range des sondes de viande)
+          - 1000.0 -> 32.0   # 0°C (Référence glace)
+          - 1144.1 -> 100.0  # 37.8°C (Zone critique début cuisson)
+          - 1285.8 -> 170.0  # 76.7°C (Cible porc/volaille)
+          - 1403.9 -> 225.0  # 107.2°C (Limite max viande)
+
+      # AJOUT DE L'OFFSET (Correction via AHT25)
+      # Si ta PT1000 affiche 74°F alors que l'AHT25 dit 72°F, 
+      # ajoute un offset de -2.0 ici :
+
+      - offset: 0.0  # Si besoin de faire un petit calibrage de correction en °F
+
+      # On lisse la température obtenue
+      - median: # Prend la valeur centrale sur 7 lectures pour éliminer les pics
+          window_size: 7
+          send_every: 1
+      - sliding_window_moving_average:
+          window_size: 25
+          send_every: 1
+
+      # On stabilise l'affichage
+      - delta: 0.1 # Ignore les micro-variations de moins de 0.1°F pour éviter que l'écran saute sans arrêt
+
+
+  # --- SONDE Aliment 2 (Sur A2) ---
+  - platform: ads1115
+    multiplexer: 'A2_GND'
+    gain: 2.048
+    id: meat_2_voltage
+    name: "Voltage sonde 2"
+    update_interval: 2.7s
+    # Affichage sur page de diagnostique
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_volt_sonde_2
+            text:
+              format: "Volt Sonde 2: %.1f V"
+              args: [ 'x' ]
+
+# --- CAPTEUR DE RÉSISTANCE (La valeur brute en Ohms) ---
+  - platform: resistance
+    id: meat_2_res
+    sensor: meat_2_voltage
+    configuration: DOWNSTREAM
+    resistor: 2185Ohm # Correction avec valeur réel de la 2200 Ohms 2173
+    name: "Résistance Sonde 2"
+    unit_of_measurement: "Ω"
+    accuracy_decimals: 1
+    # Affichage sur page de diagnostique
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_res_sonde_2
+            text:
+              format: "Rés. Sonde 2: %.1f Ω"
+              args: [ 'x' ]
+
+  # --- SONDE Aliment 2 (A2) ---
+  - platform: copy
+    source_id: meat_2_res
+    id: meat_2
+    name: "Temp. Sonde Aliment 2"
+    unit_of_measurement: "°F"
+    device_class: "temperature" # Dis à HA que c'est une température
+    state_class: "measurement"  # Dis à HA que c'est une mesure
+    accuracy_decimals: 1
+    filters:
+      # On convertit d'abord (très important)
+      - calibrate_linear:
+          # Valeurs standards PT1000 (très précises dans le range des sondes de viande)
+          - 1000.0 -> 32.0   # 0°C (Référence glace)
+          - 1144.1 -> 100.0  # 37.8°C (Zone critique début cuisson)
+          - 1285.8 -> 170.0  # 76.7°C (Cible porc/volaille)
+          - 1403.9 -> 225.0  # 107.2°C (Limite max viande)
+
+      # AJOUT DE L'OFFSET (Correction via AHT25)
+      # Si ta PT1000 affiche 74°F alors que l'AHT25 dit 72°F, 
+      # ajoute un offset de -2.0 ici :
+
+      - offset: 0.0  # Si besoin de faire un petit calibrage de correction en °F
+
+      # On lisse la température obtenue
+      - median: # Prend la valeur centrale sur 7 lectures pour éliminer les pics
+          window_size: 7
+          send_every: 1
+      - sliding_window_moving_average:
+          window_size: 25
+          send_every: 1
+          
+      # On stabilise l'affichage
+      - delta: 0.1 # Ignore les micro-variations de moins de 0.1°F pour éviter que l'écran saute sans arrêt
+
+  # Valeur d'output du PID lissé vers le script de routing, permet d'éviter les glitch à la sortie pwm
+  - platform: template
+    id: pid_output_lisse
+    name: "PID Output Lissé"
+    unit_of_measurement: "%"
+    icon: "mdi:gauge"
+    internal: false
+    filters:
+      # alpha : plus la valeur est petite, plus c'est lisse.
+      # 0.1 est un excellent point de départ pour un BBQ.
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 1
+    on_value:
+      then:
+        - lambda: |-
+            id(pid_output_level) = x; 
+            id(update_auger_routing).execute();
+
+  # valeur d'output du Prédicteur de Smith lissé vers le script de routing, permet d'éviter les glitch à la sortie pwm
+  - platform: template
+    id: smith_output_lisse
+    name: "Smith Output Lissé"
+    unit_of_measurement: "%"
+    icon: "mdi:gauge"
+    internal: false
+    filters:
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 1
+    on_value:
+      then:
+        - lambda: |-
+            id(smith_output_level) = x;
+            id(update_auger_routing).execute();
+
+  # Pour monitorer la commande au pwn dans Home Assistant
+  - platform: template
+    id: auger_duty_pct
+    name: "Sortie au PWM"
+    unit_of_measurement: "%"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      //return id(pid_output_level) * 100.0f;
+      return id(actual_routing_output) * 100.0f;  // ← Lit la valeur réellement envoyée à la sortie
+
+  - platform: template
+    id: pid_kp
+    name: "PID standard Proportionnel"
+    unit_of_measurement: " "
+    state_class: "measurement"
+    accuracy_decimals: 6
+    update_interval: 15s
+    lambda: |-
+      auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+      float k = pid_c->get_kp();
+      // Convertir kp_natif → gain pur pour affichage
+      float k_provox = k * id(plage_procede);
+      if (std::abs(k_provox - id(base_kp)) > 0.01f) return k_provox * 0.75f;
+      return k_provox;
+    on_value:
+      then:
+        - lambda: |-
+            if (std::abs(x - id(base_kp)) > 0.01f) {
+              id(autotune_active) = false;
+            }
+        - lvgl.label.update:
+            id: lbl_pid_kp
+            text:
+              format: "%s P: %.2f"
+              args: [ 'std::abs(((pid::PIDClimate *)id(bbq_pid))->get_kp() * id(plage_procede) - id(base_kp)) > 0.01f ? "Sug." : "Act."',
+                      'x' ]
+
+  - platform: template
+    id: pid_ki
+    name: "PID standard Intégral"
+    unit_of_measurement: " "
+    state_class: "measurement"
+    accuracy_decimals: 6
+    update_interval: 15s
+    lambda: |-
+      auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+      float k = pid_c->get_ki();
+      // Convertir ki_natif → rép/min pour affichage
+      float k_provox = k * id(plage_procede) * 60.0f;
+      if (std::abs(k_provox - id(base_ki)) > 0.01f) return k_provox * 0.416f;
+      return k_provox;
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_pid_ki
+            text:
+              format: "%s I: %.3f"
+              args: [ 'std::abs(((pid::PIDClimate *)id(bbq_pid))->get_ki() * id(plage_procede) * 60.0f - id(base_ki)) > 0.01f ? "Sug." : "Act."',
+                      'x' ]
+
+  - platform: template
+    id: pid_kd
+    name: "PID standard Dérivé"
+    unit_of_measurement: " "
+    state_class: "measurement"
+    accuracy_decimals: 6
+    update_interval: 15s
+    lambda: |-
+      auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+      float k = pid_c->get_kd();
+      if (std::abs(k - id(base_kd)) > 0.00001f) return k * 0.125f;
+      return k;
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_pid_kd
+            text:
+              format: "%s D: %.5f"
+              args: [ 'std::abs(((pid::PIDClimate *)id(bbq_pid))->get_kd() - id(base_kd)) > 0.00001f ? "Sug." : "Act."', 'x' ]
+
+# ============================================================
+  # SENSORS — Valeurs actives Smith ou PID natif + ratio t_ext
+  # Affichent les valeurs réellement utilisées selon le mode actif.
+  # Utile pour surveiller l'effet de la compensation t_ext.
+  # ============================================================
+
+  - platform: template
+    id: smith_kp_actif
+    name: "BBQ — Kp actif (gain pur)"
+    unit_of_measurement: ""
+    state_class: "measurement"
+    accuracy_decimals: 2
+    update_interval: 15s
+    lambda: |-
+      if (id(smith_active)) {
+          // Mode Smith : Kp en gain pur avec ratio
+          return id(base_kp) * id(ratio_ext_gel);
+      } else {
+          // Mode PID natif : convertir kp_natif → gain pur
+          return ((pid::PIDClimate *)id(bbq_pid))->get_kp() * id(plage_procede);
+      }
+
+  - platform: template
+    id: smith_ki_actif
+    name: "BBQ — Ki actif (rép⁄min)"
+    unit_of_measurement: "rép/min"
+    state_class: "measurement"
+    accuracy_decimals: 3
+    update_interval: 15s
+    lambda: |-
+      if (id(smith_active)) {
+          // Mode Smith : Ki en rép/min avec ratio
+          return id(base_ki) * id(ratio_ext_gel);
+      } else {
+          // Mode PID natif : convertir ki_natif → rép/min
+          return ((pid::PIDClimate *)id(bbq_pid))->get_ki() * id(plage_procede) * 60.0f;
+      }
+
+  - platform: template
+    id: ratio_compensation_actif
+    name: "BBQ — Ratio compensation T°ext"
+    unit_of_measurement: " "
+    state_class: "measurement"
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: |-
+      return id(ratio_ext_gel);
+
+binary_sensor:
+  - platform: template
+    id: vis_en_mouvement
+    name: "Vis en mouvement"
+
+  - platform: template
+    id: err_sonde_cuve
+    name: "Alerte Sonde Cuve"
+    device_class: problem
+
+  - platform: template
+    id: err_allumage
+    name: "Alerte Échec Allumage"
+    device_class: problem
+
+  - platform: template
+    id: err_surchauffe
+    name: "Alerte Surchauffe"
+    device_class: problem
+
+  # Senseur de détection de la porte de la trémie ouverte
+  - platform: template
+    id: porte_tremie
+    name: "Trémie État Porte"
+    device_class: door
+    lambda: |-
+      float dist = id(granules_mm).state;
+      if (std::isnan(dist)) return false;
+      // Quand porte ouverte, le capteur voit très loin ou NaN
+      // Ajuste le seuil selon ta trémie vide (ex: fond à ~300mm)
+      return dist > 600.0;
+
+# --- LOGIQUE ET RELAIS ---
+globals:
+  - id: is_igniting
+    type: bool
+    initial_value: 'false'
+  # Vrai pendant la phase de pré-refroidissement (300°F -> cible 225°F)
+  # au tout début de seq_arret, avant le reste de la séquence d'arrêt.
+  - id: pre_cooldown_active
+    type: bool
+    initial_value: 'false'
+  - id: is_cooling
+    type: bool
+    initial_value: 'false'
+  - id: is_priming
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: manual_prime_active
+    type: bool
+    initial_value: 'false'
+  - id: safety_shutdown
+    type: bool
+    initial_value: 'false'
+
+  # --- MODE PURGE VIS (vidange de fines particules ou remplissage trémie) ---
+  - id: purge_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: purge_remaining_s
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: purge_igniter_used
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Valeurs de base issues de l'autotune (Rule 'No Overshoot PID')
+  - id: autotune_active
+    type: bool
+    initial_value: 'false'
+  - id: base_kp
+    type: float
+    initial_value: '0.4' # Gain exprimé style Cntrl Industriel ancien 0.002 x plage_procede
+  - id: base_ki
+    type: float
+    initial_value: '0.15' # Intégral exprimé style Cntrl Industriel (rep/min) ancien 0.00001 x plage_procede x 60
+  - id: base_kd
+    type: float
+    initial_value: '0.0' # Valeur PI
+  - id: plage_procede
+    type: float
+    restore_value: no
+    initial_value: '450.0'   # SP_max - SP_min = 600 - 150 = 450°F
+
+  # Pour synchronisation des entrées de pid HA vers les variables globales de pid
+  - id: pid_sync_ready
+    type: bool
+    initial_value: 'false'
+
+  # Valeurs min et max de la sortie du pid
+  - id: pid_sortie_min
+    type: float
+    restore_value: yes
+    initial_value: '0.07'   # valeur initiale de 10% minimum
+
+  - id: pid_sortie_max
+    type: float
+    restore_value: yes
+    initial_value: '0.50'   # valeur initiale de 50% maximum
+
+  # Variables pour le mode fumée
+  - id: smoke_mode_active
+    type: bool
+    initial_value: 'false'
+  - id: smoke_intensity
+    type: float
+    initial_value: '0.11' # Valeur par défaut (11%) pour peu de fumée, combustion vive
+  - id: smoke_temp_min
+    type: float
+    initial_value: '150.0'
+
+# requise pour antiburn avec logo pitboss
+  - id: logo_x
+    type: int
+    initial_value: '400'
+  - id: logo_y
+    type: int
+    initial_value: '200'
+  - id: logo_dx
+    type: int
+    initial_value: '4' # Vitesse horizontale
+  - id: logo_dy
+    type: int
+    initial_value: '4' # Vitesse verticale
+
+# Variable pour manipulation de la sortie vers la vis
+  - id: pid_output_level
+    type: float
+    initial_value: '0.0'
+    
+  - id: actual_routing_output
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+    
+  # --- Variables d'état internes du Prédicteur de Smith ---
+  # Ces variables remplacent celles du PID natif pour le calcul Smith.
+  # Elles sont remises à zéro lors du passage en mode HEAT (voir seq_depart).
+  - id: pid_integral
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: pid_last_error
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: pid_last_temp
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: pid_last_time
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: smith_output_level
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: smith_roc_last
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # --- Flag d'activation du Prédicteur de Smith ---
+  # Contrôlé via le switch HA smith_predictor_active.
+  # true  → Le script Smith calcule la sortie, kp/ki/kd natifs forcés à 0
+  # false → Le PID natif ESPHome calcule normalement via pid_output_level
+  - id: smith_active
+    type: bool
+    restore_value: yes      # On mémorise le choix entre les redémarrages
+    initial_value: 'true'
+
+  # --- Flag d'activation de la compensation selon température extérieur ---
+  - id: adapt_temp_ext_active
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  # Pour possibilité accès du ratio de compensation maximum en cas de temp. extérieur froide via HA
+  - id: ratio_max_temp_ext
+    type: float
+    restore_value: yes
+    initial_value: '1.0'
+
+  # Ratio de compensation température extérieure — gelé quand BBQ en marche
+  # Utilisé pendant toute la cuisson pour stabiliser les coefficients.
+  # Valeur par défaut 1.0 = pas de compensation (équivalent 20°C)
+  - id: ratio_ext_gel
+    type: float
+    restore_value: yes      # On mémorise le dernier ratio entre les redémarrages
+    initial_value: '1.0'
+
+  # Vrai si l'API n'était toujours pas connectée 20s après le boot.
+  # Utilisé pour déclencher un reboot unique dès que l'API se connecte
+  # enfin, afin d'imiter les conditions d'une réparation manuelle.
+  - id: api_was_absent_at_boot
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  
+################################################################################
+# NOTES DE CALIBRATION — Smith Predictor
+#
+# PROCÉDURE RECOMMANDÉE pour trouver tau et theta :
+#
+# 1. Lancer le BBQ normalement jusqu'à stabilisation à une température cible.
+#
+# 2. Activer le Smith Predictor via HA (switch ON).
+#
+# 3. Faire un échelon de set_point (+20°F ou +30°F) et observer dans les logs
+#    (niveau DEBUG, tag "SMITH") les valeurs PV, Pred, et Out.
+#
+# THETA (délai de résultat de la combustion (secondes)) :
+#         Temps entre l'activation de la vis et l'effet mesurable sur la sonde.
+#         Valeur typique : 40-80s selon charge et température.
+#   - Dans les logs, note le temps entre une variation de "Out" et le début
+#     de la montée de "PV". C'est theta.
+#   - Typique BBQ granules : 40-80 secondes.
+#                            sur mon BBQ le theta est de 140s
+#
+# TAU (constante de temps thermique du BBQ (secondes)) :
+#         Représente le temps que met la chambre à atteindre 63% de sa
+#         réponse finale après un échelon d'entrée. Valeur typique : 120-220s.
+#   - Depuis le début de la montée, note le temps pour atteindre 63% de
+#     la variation finale de température. C'est tau.
+#   - Typique BBQ : 120-220 secondes selon la masse thermique.
+#                   sur mon BBQ le tau est de 240s
+#
+# CONSEIL : Commencer avec theta=50s, tau=120s, puis affiner.
+#           Augmenter theta si le PID réagit trop tôt (overshoot).
+#           Diminuer theta si la régulation est trop lente.
+################################################################################
+  
+  - id: smith_tau
+    type: float
+    restore_value: yes
+    initial_value: '240.0'   # À calibrer selon ton BBQ
+
+  - id: smith_theta
+    type: float
+    restore_value: yes
+    initial_value: '140.0'   # À calibrer selon ton BBQ
+
+# Entrées numérique, permet ajustement des paramètres via HA et servewur Web
+number:
+  - platform: template
+    id: purge_duration_min
+    name: "Purge Vis - Durée (min)"
+    icon: "mdi:timer-sand"
+    mode: BOX
+    min_value: 1
+    max_value: 10   # Plafond dur appliqué aussi côté firmware, voir seq_purge_vis
+    step: 1
+    unit_of_measurement: "min"
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    entity_category: "config"
+
+  - platform: template
+    id: tuner_kp
+    name: "PID Kp (Gain)"
+    icon: "mdi:numeric"
+    mode: BOX
+    min_value: 0.1
+    max_value: 5.0
+    step: 0.05
+    unit_of_measurement: ""
+    optimistic: true
+    entity_category: "config"
+    on_value:
+      then:
+        - lambda: |-
+            if (id(pid_sync_ready) && x != id(base_kp)) {
+              id(base_kp) = x;
+              // Si PID natif actif, convertir en unités ESPHome
+              if (!id(smith_active)) {
+                  auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+                  pid_c->set_kp(x / id(plage_procede));
+              }
+              id(update_auger_routing).execute();
+              ESP_LOGD("TUNER", "Kp mis à jour: %.2f (gain pur)", x);
+            }
+
+  - platform: template
+    id: tuner_ki
+    name: "PID Ki (Intégral rép⁄min)"
+    icon: "mdi:numeric"
+    mode: BOX
+    min_value: 0.01
+    max_value: 2.0
+    step: 0.01
+    unit_of_measurement: ""
+    optimistic: true
+    entity_category: "config"
+    on_value:
+      then:
+        - lambda: |-
+            if (id(pid_sync_ready) && x != id(base_ki)) {
+              id(base_ki) = x;
+              // Si PID natif actif, convertir en unités ESPHome
+              if (!id(smith_active)) {
+                  auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+                  pid_c->set_ki(x / (id(plage_procede) * 60.0f));
+              }
+              id(update_auger_routing).execute();
+              ESP_LOGD("TUNER", "Ki mis à jour: %.3f rép/min", x);
+            }
+
+  - platform: template
+    id: tuner_kd
+    name: "PID Kd (Dérivé)"
+    icon: "mdi:numeric"
+    mode: BOX
+    min_value: 0.0
+    max_value: 2.0
+    step: 0.01
+    optimistic: true
+    entity_category: "config"
+    on_value:
+      then:
+        - lambda: |-
+            if (id(pid_sync_ready) && x != id(base_kd)) {
+              id(base_kd) = x;
+              auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+              pid_c->set_kd(x);
+              id(update_auger_routing).execute();
+              ESP_LOGD("TUNER", "Kd mis à jour: %.5f", x);
+            }
+
+  # ============================================================
+  # NUMBER — Sortie minimum
+  # restore_value: true : survit aux flashs via système ESPHome
+  # ============================================================
+  - platform: template
+    id: sortie_min
+    name: "Sortie Min."
+    icon: "mdi:chevron-double-down"
+    mode: BOX
+    min_value: 5.0
+    max_value: 30.0
+    step: 1.0
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: true                 # ← survit aux flashs
+    entity_category: "config"
+    initial_value: 10.0                 # Utilisé seulement au 1er flash
+    on_value:
+      then:
+        - lambda: |-
+            id(pid_sortie_min) = x / 100.0f;
+            // Reset intégrale pour éviter un état sale après changement de limite
+            // Une intégrale négative accumulée pendant le blocage causerait
+            // un gel de la sortie jusqu'à ce qu'elle se résorbe naturellement
+            if (id(smith_active)) {
+                id(pid_integral) = 0.0f;
+                id(smith_roc_last) = 0.0f;
+            }
+            ESP_LOGD("SMITH", "Sortie minimum mis à jour: %.1f%%", x);
+
+  # ============================================================
+  # NUMBER — Sortie maximum
+  # restore_value: true : survit aux flashs via système ESPHome
+  # ============================================================
+  - platform: template
+    id: sortie_max
+    name: "Sortie Max."
+    icon: "mdi:chevron-double-up"
+    mode: BOX
+    min_value: 40.0
+    max_value: 100.0
+    step: 1.0
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: true                 # ← survit aux flashs
+    entity_category: "config"
+    initial_value: 50.0                 # Utilisé seulement au 1er flash
+    on_value:
+      then:
+        - lambda: |-
+            id(pid_sortie_max) = x / 100.0f;
+            // Reset intégrale pour éviter un état sale après changement de limite
+            // Une intégrale négative accumulée pendant le blocage causerait
+            // un gel de la sortie jusqu'à ce qu'elle se résorbe naturellement
+            if (id(smith_active)) {
+                id(pid_integral) = 0.0f;
+                id(smith_roc_last) = 0.0f;
+            }
+            ESP_LOGD("SMITH", "Sortie maximum mis à jour: %.1f%%", x);
+
+
+  # ============================================================
+  # NUMBER — tuner_smith_tau (corrigé)
+  # restore_value: true : survit aux flashs via système ESPHome
+  # ============================================================
+  - platform: template
+    id: tuner_smith_tau
+    name: "Smith Const. temps(tau)"
+    icon: "mdi:timer-sand"
+    mode: BOX
+    min_value: 120.0
+    max_value: 300.0
+    step: 5.0
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true                 # ← survit aux flashs
+    entity_category: "config"
+    initial_value: 240.0                 # Utilisé seulement au 1er flash
+    on_value:
+      then:
+        - lambda: |-
+            id(smith_tau) = x;
+            ESP_LOGD("SMITH", "tau mis à jour: %.1f s", x);
+
+
+  # ============================================================
+  # NUMBER — tuner_smith_theta (corrigé)
+  # restore_value: true : survit aux flashs via système ESPHome
+  # ============================================================
+  - platform: template
+    id: tuner_smith_theta
+    name: "Smith Délai transport (theta)"
+    icon: "mdi:timer-play-outline"
+    mode: BOX
+    min_value: 30.0
+    max_value: 150.0
+    step: 5.0
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true                 # ← survit aux flashs
+    entity_category: "config"
+    initial_value: 140.0                 # Utilisé seulement au 1er flash
+    on_value:
+      then:
+        - lambda: |-
+            id(smith_theta) = x;
+            ESP_LOGD("SMITH", "theta mis à jour: %.1f s", x);
+
+  # ============================================================
+  # NUMBER — ratio_max_temp_ext
+  # restore_value: true : survit aux flashs via système ESPHome
+  # ============================================================
+  - platform: template
+    id: tuner_ratio_temp_max
+    name: "Ratio max comp temp. ext."
+    icon: "mdi:numeric"
+    mode: BOX
+    min_value: 1.0
+    max_value: 3.0
+    step: 0.1
+    unit_of_measurement: ""
+    optimistic: true
+    restore_value: true                 # ← survit aux flashs
+    entity_category: "config"
+    initial_value: 1.5                 # Utilisé seulement au 1er flash
+    on_value:
+      then:
+        - lambda: |-
+            id(ratio_max_temp_ext) = x;
+            ESP_LOGD("SMITH", "Ratio max. comp. temp. extérieur mis à jour: %.1f", x);
+
+button:
+  # Permet l'arrêt du BBQ à distance
+  - platform: template
+    name: "Arrêt BBQ"
+    id: btn_stop_ha
+    icon: "mdi:power-off"
+    on_press:
+      then:
+        - script.execute: seq_arret
+
+# Bouton de redémarrage interne, utilisé uniquement par l'automation
+# api.on_client_connected ci-dessus (voir globals: api_was_absent_at_boot).
+# Non exposé à Home Assistant (internal: true).
+  - platform: restart
+    name: "Reboot (API absente au boot)"
+    id: panel_reboot_on_late_api
+    internal: true
+
+#-------------------------------------------
+# Sortie discrete
+#-------------------------------------------
+switch:
+# Switch Antiburn
+  - platform: template
+    name: Antiburn
+    id: switch_antiburn
+    icon: mdi:television-shimmer
+    optimistic: true
+    entity_category: "config"
+    disabled_by_default: true
+    turn_on_action:
+      - logger.log: "Starting Antiburn"
+      # Affiche logo pitboss flottant
+      - lvgl.widget.show: antiburn_curtain  # On tire le rideau
+      - lvgl.widget.show: container_antiburn # On affiche le logo
+      - lvgl.widget.hide: nav_matrix # On cache le menu de navigation dans le bas de la page
+      - light.control:
+          id: lcd_backlight
+          brightness: 25%
+
+    turn_off_action:
+      - logger.log: "Stopping Antiburn"
+      # Cache le logo Pitboss et allume rétro à 100%
+      - lvgl.widget.hide: container_antiburn
+      - lvgl.widget.hide: antiburn_curtain   # On range le rideau
+      - lvgl.widget.show: nav_matrix # On cache le menu de navigation dans le bas de la page
+      - light.turn_on:
+          id: lcd_backlight
+          brightness: 100%
+          
+  # ============================================================
+  # SWITCH — smith_predictor_active (corrigé)
+  # optimistic: true + restore_mode gère la persistance
+  # indépendamment de la NVS des globales (survit aux flashs)
+  # ============================================================
+  - platform: template
+    id: smith_predictor_active
+    name: "Prédicteur de Smith"
+    icon: "mdi:chart-timeline-variant-shimmer"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON    # ON par défaut, mémorisé entre flashs
+
+    turn_on_action:
+      - lambda: |-
+          id(smith_active) = true;
+          auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+          pid_c->set_kp(0.0f);
+          pid_c->set_ki(0.0f);
+          pid_c->set_kd(0.0f);
+          id(pid_integral)   = 0.0f;
+          id(pid_last_error) = 0.0f;
+          id(pid_last_temp)  = id(bbq_temp_pv).state;
+          id(pid_last_time)  = 0;
+          ESP_LOGI("SMITH", "Prédicteur de Smith ACTIVÉ — PID natif neutralisé");
+      - script.execute: update_auger_routing
+
+    turn_off_action:
+      - lambda: |-
+          id(smith_active) = false;
+          auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+          // Conversion unités PROVOX → ESPHome pour PID natif
+          pid_c->set_kp(id(base_kp) / id(plage_procede));
+          pid_c->set_ki(id(base_ki) / (id(plage_procede) * 60.0f));
+          pid_c->set_kd(0.0f);
+          pid_c->reset_integral_term();
+          ESP_LOGI("SMITH", "Prédicteur de Smith DÉSACTIVÉ — PID natif restauré "
+                   "Kp_natif:%.5f Ki_natif:%.6f",
+                   id(base_kp) / id(plage_procede),
+                   id(base_ki) / (id(plage_procede) * 60.0f));
+      # Forcer une mise à jour immédiate de la vis avec le nouveau mode
+      - script.execute: update_auger_routing
+
+
+  # ============================================================
+  # SWITCH — Activation compensation selon température extérieur
+  # optimistic: true + restore_mode gère la persistance
+  # indépendamment de la NVS des globales (survit aux flashs)
+  # ============================================================
+  - platform: template
+    id: switch_adapt_temp_ext
+    name: "Compensation température extérieure"
+    icon: "mdi:thermometer-auto"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          id(adapt_temp_ext_active) = true;
+          ESP_LOGI("ADAPT", "Compensation t_ext ACTIVÉE");
+    turn_off_action:
+      - lambda: |-
+          id(adapt_temp_ext_active) = false;
+          id(ratio_ext_gel) = 1.0f;
+          ESP_LOGI("ADAPT", "Compensation t_ext DÉSACTIVÉE — ratio forcé à 1.0");
+      - script.execute: update_auger_routing
+
+# Rétro-éclairage              
+  - platform: gpio
+    id: backlight_enable
+    restore_mode: ALWAYS_ON
+    pin:
+      waveshare_io_ch32v003: waveshare_io_hub
+      number: 2
+      mode: { output: true }
+
+# Ventilateur      
+  - platform: gpio
+    id: fan_relay
+    name: "BBQ Ventilateur"
+    pin:
+      mcp23xxx: mcp_hub # C'est ici la correction : _id
+      number: 0
+      mode: OUTPUT
+    on_turn_on:
+      - script.execute: stop_antiburn
+      - script.execute: start_antiburn_temporise
+    on_turn_off:
+      - script.execute: stop_antiburn
+      - script.execute: start_antiburn_temporise
+# Allumeur
+  - platform: gpio
+    id: igniter_relay
+    name: "BBQ Allumeur"
+    pin:
+      mcp23xxx: mcp_hub
+      number: 1
+      mode: OUTPUT
+    # --- SÉCURITÉ : VERROUILLAGE AVEC LE VENTILATEUR ---
+    on_turn_on:
+      - if:
+          condition:
+            switch.is_off: fan_relay
+          then:
+            - switch.turn_off: igniter_relay
+            - logger.log: "ERREUR CRITIQUE: Tentative d'allumage sans ventilateur !"
+            - lvgl.obj.update:
+                id: main_page
+                bg_color: 0xE65100 # Orange foncé pour alerte
+# Chauffage du boitier
+  - platform: gpio
+    id: ptc_heater
+    name: "Chauffage Boitier"
+    pin:
+      mcp23xxx: mcp_hub
+      number: 2
+      mode: OUTPUT
+
+#----------------------------------------------
+
+#----------------------------------------------
+text_sensor:
+  # Affichage de l'adresse IP
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      on_value:
+        then:
+          - lvgl.label.update:
+              id: lbl_ip
+              text: !lambda 'return x;'
+    ssid:
+      name: "SSID WiFi"
+    mac_address:
+      name: "ADRESSE MAC"
+
+#-------------------------------------------
+# Contrôleur de température PID
+#-------------------------------------------
+climate:
+  - platform: pid
+    id: bbq_pid
+    name: "Cntrl_Temp_BBQ °F"
+    sensor: bbq_temp_pv
+    heat_output: pid_out
+    default_target_temperature: 180°F
+    # 2. Configuration de la bande morte
+    deadband_parameters:
+      threshold_high: 2.0  # Température au-dessus de la cible
+      threshold_low: -2.0  # Température en-dessous de la cible
+    control_parameters:
+      # Valeur PID initial à zéro le tuning est réglé dans les varaibles globales
+      kp: 0.0
+      ki: 0.0
+      kd: 0.0
+      # Valeur initial de limitation du pouvoir de correction de l'integral,
+      # ces valeur vont changer dinamiquement selon température extérieur dans l'interval 60s
+      min_integral: 0.10 #-0.20
+      max_integral: 0.50 #0.25
+    visual: { min_temperature: 150, max_temperature: 600, temperature_step: 5}
+
+    # --- Mise à jour des élément visuel lvgl si changement dans Home Assistant ---
+    on_control:
+      then:
+        - lambda: |-
+            static float last_reported_target = -1.0; 
+            
+            if (x.get_target_temperature().has_value()) {
+                float current_target = *x.get_target_temperature();
+                
+                // On ne met à jour l'affichage QUE si la valeur a changé de plus de 0.5 degré
+                if (std::abs(current_target - last_reported_target) > 4.0f) {
+                    last_reported_target = current_target;
+
+                    // 1. Mise à jour de la cible (SP) de l'Arc
+                    lv_arc_set_value(id(arc_sp), (int)current_target);
+
+                    // 2. Mise à jour du texte du Preset
+                    std::string val_str = esphome::str_sprintf("%.0f°F", current_target);
+                    id(select_temp_preset).set_selected_text(val_str.c_str(), LV_ANIM_ON);
+
+                    // 3. Affichage du label de confirmation
+                    lv_obj_clear_flag(id(lbl_selection_live), LV_OBJ_FLAG_HIDDEN);
+                    lv_label_set_text(id(lbl_selection_live), esphome::str_sprintf("Cible: %.0f°F", current_target).c_str());
+                    
+                    // On n'appelle le script que lors d'un changement réel
+                    id(cacher_label_selection).execute();
+
+                    // 4. Reset intégrale Smith lors d'un changement de SP
+                    // Évite le dépassement causé par l'intégrale accumulée
+                    // à l'ancien SP qui s'additionne au P du nouvel écart.
+                    if (id(smith_active)) {
+                        id(pid_integral)   = 0.0f;
+                        id(smith_roc_last) = 0.0f;
+                        ESP_LOGI("SMITH", "Reset intégrale — changement SP: %.1f°F",
+                                 current_target);
+                    }
+                }
+            }
+
+image:
+  # Logo Pitboss pour écran de veille
+  - platform: file
+    file: "pitboss_logo.png"
+    id: img_logo_antiburn
+    # Nouvelle syntaxe pour remplacer RGBA
+    type: RGB
+    transparency: alpha_channel
+
+#-------------------------------------------
+# Script d'automatisation
+#-------------------------------------------
+script:
+  # Script d'affichage de l'heure sur chaque page
+  - id: time_update
+    then:
+      - lvgl.label.update:
+          id: lbl_current_time
+          text:
+            time_format: "%H:%M"
+            time: !lambda return id(homeassistant_time).now();
+
+  # Script de démarrage de la protection de l'écran cristaux liquide
+  - id: start_antiburn_temporise
+    mode: restart # Très important : relance le chrono de 5 min à chaque appel
+    then:
+      - delay: 5min
+      - if:
+          condition:
+            switch.is_on: fan_relay
+          then:
+            # CAS 1 : Le ventilateur tourne -> On baisse seulement la luminosité
+            - light.control:
+                id: lcd_backlight
+                brightness: 100%
+            - logger.log: "Inactivité (Ventilateur ON) : Luminosité à 10 pourcent"
+          else:
+            # CAS 2 : Le ventilateur est arrêté -> OFF complet et Antiburn ON
+            - switch.turn_on: switch_antiburn
+            - logger.log: "Inactivité (Ventilateur OFF) : Écran OFF et Antiburn ON"
+
+  # Script d'arrêt de la protection de l'écran cristaux liquide
+  - id: stop_antiburn
+    mode: restart
+    then:
+      - script.stop: start_antiburn_temporise
+      - switch.turn_off: switch_antiburn
+      - logger.log: "Activité détectée : Écran 100 pourcent et Antiburn OFF"
+
+  # Script de départ du BBQ
+  - id: seq_depart
+    mode: restart
+    then:
+      - globals.set: {id: is_igniting, value: 'true'}
+      - switch.turn_on: fan_relay
+      - switch.turn_on: igniter_relay
+
+      # Applique les 20% d'allumage
+      - script.execute: update_auger_routing
+
+      - wait_until:
+          condition:
+            sensor.in_range: {id: bbq_temp_pv, above: 135.0}
+          timeout: 15min
+
+      - if:
+          condition:
+            sensor.in_range: {id: bbq_temp_pv, above: 135.0}
+          then:
+            - logger.log: "Feu détecté. Stabilisation 2min..."
+            - switch.turn_off: igniter_relay
+            - delay: 2min
+
+            # 1a. Reset intégrale PID natif (utile en mode PID pur)
+            - climate.pid.reset_integral_term: {id: bbq_pid}
+
+            # 1b. Reset Smith AVANT climate.control ET AVANT is_igniting=false
+            #     Garantit que le 1er cycle Smith repart avec état propre.
+            #     pid_last_temp=0.0 force roc=0 au premier cycle.
+            - lambda: |-
+                if (id(smith_active)) {
+                    id(pid_integral)   = 0.0f;
+                    id(pid_last_error) = 0.0f;
+                    id(pid_last_temp)  = 0.0f;
+                    id(pid_last_time)  = 0;
+                    //id(smith_output_lisse).publish_state(0.10f);
+                    //id(smith_output_level) = 0.10f;
+                    id(smith_output_lisse).publish_state(id(pid_sortie_min));
+                    id(smith_output_level) = id(pid_sortie_min);
+                    ESP_LOGI("SMITH", "Reset Smith — EMA initialisé à 10%%.");
+                }
+
+            # 2. Démarre le PID (interface HA uniquement si Smith actif)
+            - climate.control: {id: bbq_pid, mode: "HEAT"}
+              # règle la cible à 180
+            - climate.control: {id: bbq_pid, target_temperature: 180}
+
+            # 3. Libère is_igniting APRÈS le reset — état propre garanti
+            - globals.set: {id: is_igniting, value: 'false'}
+
+            # 4. Mise à jour immédiate de la vis
+            - script.execute: update_auger_routing
+
+            - logger.log: "Régulation PID active."
+
+          else:
+            - binary_sensor.template.publish: {id: err_allumage, state: ON}
+            - script.execute: seq_emergency_stop
+
+  # Script d'arrêt du BBQ
+  - id: seq_arret
+    mode: restart
+    then:
+      # 0. Pré-refroidissement contrôlé si température élevée (> 300°F) :
+      #    on ne coupe pas tout de suite, on ramène d'abord le feu à une
+      #    cible de 200°F sous régulation PID, puis on attend d'être sous
+      #    225°F (pas besoin d'atteindre la cible) avant d'entamer la
+      #    séquence d'arrêt normale.
+      #    Évite un choc thermique / flambée en coupant l'auger et
+      #    l'allumeur d'un coup alors que le pot est encore très chaud.
+      - globals.set: {id: pre_cooldown_active, value: 'false'}    # Reset (évite un état figé si le script redémarre)
+      - if:
+          condition:
+            lambda: 'return id(bbq_temp_pv).state > 300.0;'
+          then:
+            - globals.set: {id: pre_cooldown_active, value: 'true'}
+            - logger.log: "Séquence d'arrêt : température élevée, refroidissement contrôlé vers sortie PWM à 3%%"
+            - climate.control: {id: bbq_pid, mode: "OFF"}
+            - output.set_level: {id: auger_slow_pwm, level: 0.03}
+            #- climate.control: {id: bbq_pid, mode: "HEAT"}
+            #- climate.control: {id: bbq_pid, target_temperature: 200}
+            - wait_until: { sensor.in_range: {id: bbq_temp_pv, below: 225.0} }
+            - globals.set: {id: pre_cooldown_active, value: 'false'}
+            - logger.log: "Température sous 225°F, poursuite de la séquence d'arrêt normale"
+
+      - globals.set: {id: is_cooling, value: 'true'}                      # Vrai dans séquence d'arrêt du BBQ
+      - globals.set: {id: is_igniting, value: 'false'}                    # Faux dans allumage en cours... (allumage terminé)
+      - switch.turn_off: igniter_relay                                    # Arrêt de l'allumeur
+      #- climate.control: {id: bbq_pid, mode: "OFF"}                       # Cntrl de température du BBQ en mode OFF
+      - output.set_level: {id: auger_slow_pwm, level: 0.0}                # Temps de la vis au mimimum (0%)
+      - globals.set: {id: smoke_mode_active, value: 'false'}              # Arrête le mode fumée
+      - switch.turn_on: fan_relay                                         # Départ du ventilateur
+      - delay: 5min                                                       # Attente de 5 minutes
+      - wait_until: { sensor.in_range: {id: bbq_temp_pv, below: 125.0} }  # Attente température < 120 °F
+      - switch.turn_off: fan_relay                                        # Arrêt du ventilateur
+      - globals.set: {id: is_cooling, value: 'false'}                     # Faux dans séquence d'arrêt du BBQ (BBQ arrêté)
+
+  # ------------------------------------------------------------------
+  # Script de PURGE VIS
+  # Usage : (1) URGENCE — vider les fines particules qui bloquent le
+  #         flux d'air dans la vis pendant la séquence d'arrêt
+  #         (is_cooling), risque de remontée de braise/fumée dans la
+  #         trémie. Dans ce cas, l'allumeur est activé EN MÊME TEMPS
+  #         que la vis, pour brûler les granules au fur et à mesure
+  #         qu'elles arrivent plutôt que de les laisser s'empiler.
+  #         (2) REMPLISSAGE — faire avancer des granules neuves après
+  #         un remplissage de trémie vide, BBQ à l'arrêt complet
+  #         (is_cooling = false). Dans ce cas, l'allumeur reste ÉTEINT :
+  #         on veut juste amorcer la vis, pas démarrer un feu.
+  # Autorisé quand le BBQ est à l'arrêt complet OU en séquence d'arrêt
+  # (is_cooling). Refusé pendant l'allumage normal, la régulation
+  # (HEAT), ou un arrêt d'urgence en cours.
+  # Sécurités : plafond dur de 10 min peu importe le réglage HA, et
+  # coupure immédiate + arrêt d'urgence si surchauffe détectée.
+  # Fin de purge : en mode URGENCE, enchaîne sur seq_arret (refroidissement
+  # complet). En mode REMPLISSAGE, aucun refroidissement requis (BBQ déjà
+  # froid, allumeur jamais activé) : coupe simplement le ventilateur.
+  # ------------------------------------------------------------------
+  - id: seq_purge_vis
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return (!id(safety_shutdown) && !id(is_igniting) &&
+                      id(bbq_pid).mode != climate::CLIMATE_MODE_HEAT &&
+                      !id(purge_active));
+          then:
+            - globals.set: {id: purge_active, value: 'true'}
+
+            # Plafond dur : 10 min max, peu importe le réglage HA
+            - lambda: |-
+                int minutes = (int)id(purge_duration_min).state;
+                if (minutes < 1) minutes = 1;
+                if (minutes > 10) minutes = 10;
+                id(purge_remaining_s) = minutes * 60;
+
+            # Allumeur ET ventilateur activés SEULEMENT en purge d'urgence
+            # (is_cooling). En remplissage à l'arrêt complet, on n'allume
+            # rien et le ventilateur reste éteint (pas de combustion, donc
+            # pas besoin d'air).
+            - if:
+                condition:
+                  lambda: 'return id(is_cooling);'
+                then:
+                  - switch.turn_on: fan_relay
+                  - switch.turn_on: igniter_relay
+                  - globals.set: {id: purge_igniter_used, value: 'true'}
+                  - logger.log: "Purge vis démarrée — mode URGENCE (cooling) : vis 100(pourcent) + allumeur + ventilateur"
+                else:
+                  - globals.set: {id: purge_igniter_used, value: 'false'}
+                  - logger.log: "Purge vis démarrée — mode REMPLISSAGE (arrêt) : vis 100(pourcent) seulement, sans ventilateur"
+
+            - script.execute: update_auger_routing
+            - lvgl.obj.update: {id: btn_purge, bg_color: 0xff7f00}
+
+            # Boucle de compte à rebours (1s) avec vérif surchauffe à chaque tour
+            - while:
+                condition:
+                  lambda: 'return id(purge_active) && (id(purge_remaining_s) > 0);'
+                then:
+                  - lvgl.label.update:
+                      id: lbl_purge_text
+                      text: !lambda |-
+                        int m = id(purge_remaining_s) / 60;
+                        int s = id(purge_remaining_s) % 60;
+                        return str_sprintf("PURGE\n%d:%02d", m, s);
+                  - delay: 1s
+                  - globals.set:
+                      id: purge_remaining_s
+                      value: !lambda 'return id(purge_remaining_s) - 1;'
+                  - if:
+                      condition:
+                        lambda: 'return id(bbq_temp_pv).state > 600.0;'
+                      then:
+                        - logger.log: "Purge vis : surchauffe détectée, arrêt d'urgence"
+                        - globals.set: {id: purge_active, value: 'false'}
+                        - script.execute: seq_emergency_stop
+
+            # --- Fin de la purge (normale, arrêt manuel, ou surchauffe) ---
+            # switch.turn_off est sans effet si l'allumeur n'avait pas été
+            # activé (mode remplissage) — appel sans condition, sans risque.
+            - globals.set: {id: purge_active, value: 'false'}
+            - switch.turn_off: igniter_relay
+            - script.execute: update_auger_routing
+            - lvgl.obj.update: {id: btn_purge, bg_color: 0x1877F2}
+            - lvgl.label.update: {id: lbl_purge_text, text: "PURGE\nVIS"}
+            - logger.log: "Purge vis terminée"
+
+            # Refroidissement sécuritaire (seq_arret) SEULEMENT si l'allumeur
+            # a été utilisé (mode urgence/cooling) et pas déjà pris en charge
+            # par seq_emergency_stop. En mode remplissage (BBQ déjà froid,
+            # allumeur jamais activé), aucun risque : on coupe simplement le
+            # ventilateur et on revient à l'arrêt directement.
+            - if:
+                condition:
+                  lambda: 'return id(purge_igniter_used) && !id(safety_shutdown);'
+                then:
+                  - logger.log: "Purge vis : mode urgence -> refroidissement sécuritaire (seq_arret)"
+                  - script.execute: seq_arret
+                else:
+                  - if:
+                      condition:
+                        lambda: 'return !id(purge_igniter_used);'
+                      then:
+                        - switch.turn_off: fan_relay
+                        - logger.log: "Purge vis : mode remplissage -> arrêt direct, aucun risque"
+          else:
+            - logger.log: "Purge vis refusée : BBQ en marche, en allumage, ou en erreur"
+
+  # Script d'amorçage de granule 30 secondes
+  - id: seq_amorcage_chrono
+    mode: single
+    then:
+      - globals.set: {id: is_priming, value: 'true'}
+      - logger.log: "Amorçage 10s lancé"
+      - lvgl.obj.update:
+          id: btn_prime
+          bg_color: 0xFF9800
+      # Plus de output.set_level ici — le routeur voit is_priming=true et met 1.0
+      - delay: 10s
+      # Plus de output.set_level ici non plus
+      - globals.set: {id: is_priming, value: 'false'}
+      - logger.log: "Amorçage terminé"
+
+  # Script d'arrêt d'urgence
+  - id: seq_emergency_stop
+    mode: restart
+    then:
+      - logger.log: "!!! SÉCURITÉ THERMIQUE ACTIVÉE !!!"                  # Message dans le log (Sécurité thermique activée)
+      - globals.set: {id: safety_shutdown, value: 'true'}                 # Vrai dans Arrêt d'urgence en cours...
+      - climate.control: {id: bbq_pid, mode: "OFF"}                       # Arrêt du contrôleur bbq_pid
+      - switch.turn_off: igniter_relay                                    # Arrêt de l'allumeur
+      - output.set_level: {id: auger_slow_pwm, level: 0.0}                # Arrêt de la vis
+      - switch.turn_on: fan_relay                                         # Ventilateur en marche
+      #- lvgl.obj.update:                                                  # Background de la page principale en rouge
+          #id: main_page
+          #bg_color: 0xC62828
+      
+      - delay: 15min                                                      # Temps pour brûler les résidus et refroidir le pot
+      - switch.turn_off: fan_relay                                        # Arrêt du ventilateur
+      - logger.log: "Arrêt d'urgence terminé. Inspection requise."        # Message dans le log (Inspection requise)
+
+  # Script de réinitialisation manuel des erreurs
+  - id: reset_systeme_erreurs
+    then:
+      - logger.log: "Reset manuel des erreurs"
+      # 1. Éteindre les bits d'erreur
+      - binary_sensor.template.publish: { id: err_allumage, state: OFF }
+      - binary_sensor.template.publish: { id: err_surchauffe, state: OFF }
+      # 2. Remettre le fond d'écran normal (Gris très pâle)
+      - lvgl.obj.update:
+          id: main_page
+          bg_color: ${color_bg}
+      # 3. Remettre les textes de diagnostic en état normal
+      - lvgl.label.update: { id: lbl_diag_allumage, text: "ALLUMAGE: OK", text_color: 0xFFFFFF }
+      - lvgl.label.update: { id: lbl_diag_surchauffe, text: "TEMPÉRATURE: OK", text_color: 0xFFFFFF }
+
+  # Script de vérification d'appuie long (3 secondes) sur bouton Départ
+  - id: check_long_press
+    mode: restart
+    then:
+      - delay: 3s
+      # Si on arrive ici, c'est que le bouton est resté appuyé 3s sans être relâché
+      - lvgl.widget.show: start_confirm_box
+      - logger.log: "Appui long validé !"
+
+  # Script de vérification d'appuie long (3 secondes) sur bouton autotune
+  - id: check_long_press_autotune
+    mode: restart
+    then:
+      - delay: 3s
+      - lvgl.widget.show: autotune_confirm_box
+      - logger.log: "Appui long autotune validé !"
+
+  # Script de visualisation de la valeur sélectionné à partir de l'arc
+  - id: cacher_label_selection
+    mode: restart
+    then:
+      - delay: 3s
+      - if:
+          condition:
+            lambda: |-
+              // Utilisation de la fonction LVGL pour lire la valeur
+              int val = lv_arc_get_value(id(arc_sp));
+              
+              // Liste de tes presets
+              std::vector<int> presets = {150, 180, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500};
+              
+              // On vérifie si on est pile sur un preset
+              for(int p : presets) {
+                if (val == p) return true;
+              }
+              return false;
+          then:
+            - lambda: |-
+                lv_obj_add_flag(id(lbl_selection_live), LV_OBJ_FLAG_HIDDEN);
+          else:
+            # Si on n'est pas sur un preset, on attend encore 1s avant de réessayer
+            - delay: 3s
+            - script.execute: cacher_label_selection
+
+  # Script d'aiguillage de la valeur envoyé à la sortie physique de la vis d'alimentation de granules
+  - id: update_auger_routing
+    then:
+      - lambda: |-
+          float val = 0.0f;
+
+          // ================================================================
+          // BRANCHE A : PRÉDICTEUR DE SMITH
+          // La valeur brute P+I+D est calculée dans update_smith_output,
+          // puis lissée via smith_out → smith_output_lisse → smith_output_level.
+          // Ici on lit simplement smith_output_level (déjà lissé).
+          // ================================================================
+          if (id(smith_active) &&
+              id(bbq_pid).mode == CLIMATE_MODE_HEAT &&
+              !id(is_igniting) && !id(is_cooling)) {
+
+              val = id(smith_output_level);
+
+          // ================================================================
+          // RESET PRÉVENTIF — Smith actif mais pas en mode calcul
+          // Garde l'état interne propre pendant allumage, refroidissement
+          // ou mode OFF pour éviter windup et pic D au redémarrage.
+          // ================================================================
+          } else if (id(smith_active) &&
+                     (id(is_igniting) || id(is_cooling) ||
+                      id(bbq_pid).mode == CLIMATE_MODE_OFF)) {
+              id(pid_integral)   = 0.0f;
+              id(pid_last_error) = 0.0f;
+              id(pid_last_temp)  = id(bbq_temp_pv).state;
+              id(pid_last_time)  = 0;
+
+          // ================================================================
+          // BRANCHE B : PID NATIF ESPHOME
+          // Même pipeline que Smith mais côté natif :
+          // pid_out → pid_output_lisse → pid_output_level
+          // ================================================================
+          } else if (!id(smith_active) &&
+                     id(bbq_pid).mode == CLIMATE_MODE_HEAT &&
+                     !id(is_igniting) && !id(is_cooling)) {
+              val = id(pid_output_level);
+          }
+
+          // ================================================================
+          // LOGIQUE DE ROUTAGE PAR PRIORITÉ
+          // Ces états ont priorité absolue sur les calculs PID/Smith.
+          // ================================================================
+          if (id(is_priming) || id(manual_prime_active) || id(purge_active)) {
+              val = 1.0f;
+          } else if (id(is_igniting)) {
+              val = 0.20f;
+          } else if (id(smoke_mode_active)) {
+              val = id(smoke_intensity);
+          }
+
+          // ================================================================
+          // SÉCURITÉS ET LIMITES PHYSIQUES
+          // ================================================================
+          bool calcul_actif = (id(bbq_pid).mode != CLIMATE_MODE_OFF || id(autotune_active));
+          if (calcul_actif && !id(is_cooling)) {
+              if (!id(is_priming) && !id(manual_prime_active) && !id(purge_active)) {
+                  //float min_allowed = id(smoke_mode_active) ? 0.05f : 0.10f;
+                  //if (val < min_allowed) val = min_allowed;
+                  //if (val > 0.50f) val = 0.50f;
+                  float min_allowed = id(smoke_mode_active) ? 0.05f : id(pid_sortie_min);
+                  if (val < min_allowed) val = min_allowed;
+                  if (val > id(pid_sortie_max)) val = id(pid_sortie_max);
+              }
+          }
+
+          // ================================================================
+          // ACTION PHYSIQUE
+          // ================================================================
+          id(actual_routing_output) = val;
+          id(auger_slow_pwm).set_level(val);
+
+          // ================================================================
+          // AFFICHAGE LVGL
+          // ================================================================
+          if (id(purge_active)) {
+              lv_label_set_text(id(lbl_duty), "Charge PURGE VIS: 100%");
+          } else if (id(is_priming) || id(manual_prime_active)) {
+              lv_label_set_text(id(lbl_duty), "Charge AMORÇAGE: 100%");
+          } else if (id(is_igniting)) {
+              lv_label_set_text(id(lbl_duty), "Charge ALLUMAGE: 20%");
+          } else if (id(autotune_active)) {
+              lv_label_set_text(id(lbl_duty), str_sprintf("AUTO-TUNE: %.0f%%", (val * 100.0f)).c_str());
+          } else if (id(smoke_mode_active)) {
+              lv_label_set_text(id(lbl_duty), str_sprintf("Charge FUMÉE: %.0f%%", (val * 100.0f)).c_str());
+          } else if (id(bbq_pid).mode == CLIMATE_MODE_OFF || id(pre_cooldown_active)) {
+              lv_label_set_text(id(lbl_duty), "Charge: Prérefroidissement (3%)");
+          } else if (id(bbq_pid).mode == CLIMATE_MODE_OFF || !id(pre_cooldown_active)) {
+              lv_label_set_text(id(lbl_duty), "Charge: ARRÊT (0%)");
+          } else if (id(smith_active)) {
+              lv_label_set_text(id(lbl_duty), str_sprintf("Smith PID: %.0f%%", (val * 100.0f)).c_str());
+          } else {
+              lv_label_set_text(id(lbl_duty), str_sprintf("Charge PID: %.0f%%", (val * 100.0f)).c_str());
+          }
+
+  # ================================================================
+  # SCRIPT update_smith_output
+  # Calcule P+I+D et écrit dans smith_out (output template).
+  # Le pipeline smith_out → smith_output_lisse → smith_output_level
+  # applique le filtre EMA puis déclenche update_auger_routing
+  # via on_value de smith_output_lisse.
+  # Appelé par : on_value de bbq_temp_pv (même déclencheur que
+  # pid_out pour le PID natif).
+  # ================================================================
+  - id: update_smith_output
+    then:
+      - lambda: |-
+
+          // Ne calculer que si Smith est actif et en mode régulation
+          if (!id(smith_active) ||
+              id(bbq_pid).mode != CLIMATE_MODE_HEAT ||
+              id(is_igniting) || id(is_cooling)) {
+              return;
+          }
+
+          // --- Calcul du pas de temps (dt) ---
+          uint32_t now = millis();
+          float dt;
+          if (id(pid_last_time) == 0) {
+              dt = 1.0f;
+          } else {
+              dt = (float)(now - id(pid_last_time)) / 1000.0f;
+          }
+          if (dt > 5.0f) dt = 5.0f;
+
+          // Met à jour pid_last_time AVANT la garde
+          id(pid_last_time) = now;
+
+          // --- Protection double-appel ---
+          if (dt < 0.5f) {
+              ESP_LOGV("SMITH", "Cycle ignoré — dt trop court: %.3fs", dt);
+              return;
+          }
+
+          // --- Lecture des entrées ---
+          float current_temp = id(bbq_temp_pv).state;
+          float set_point    = id(bbq_pid).target_temperature;
+          float tau          = id(smith_tau);
+          float theta        = id(smith_theta);
+
+          // --- Vérification NaN ---
+          if (std::isnan(current_temp)) {
+              ESP_LOGW("SMITH", "Sonde PV NaN — calcul annulé");
+              return;
+          }
+
+          // Sécurité : PID natif bien neutralisé
+          auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+          pid_c->set_kp(0.0f);
+          pid_c->set_ki(0.0f);
+          pid_c->set_kd(0.0f);
+
+          // --- Taux de variation de la température (°F/s) ---
+          // On conserve le dernier roc valide tant que la temp n'a pas changé
+          // (sonde ADS1115 publie toutes les 5s)
+          float roc = id(smith_roc_last);
+          if (id(pid_last_temp) > 0.0f &&
+              std::abs(current_temp - id(pid_last_temp)) > 0.05f) {
+              roc = (current_temp - id(pid_last_temp)) / dt;
+              if (roc >  2.0f) roc =  2.0f;
+              if (roc < -2.0f) roc = -2.0f;
+              id(smith_roc_last) = roc;
+          }
+
+          // --- Température prédite dans 'theta' secondes ---
+          // Facteur Smith = (1 - e^(-theta/tau))
+          float smith_factor   = 1.0f - expf(-theta / tau);
+          float predicted_temp = current_temp + (roc * theta * smith_factor);
+
+          // --- Erreurs ---
+          float error = set_point - current_temp;
+
+          // Zone morte sur roc : en régime établi ET erreur faible,
+          // on utilise l'erreur réelle pour éviter les oscillations.
+          // Si erreur réelle > 10°F, on force la prédiction active.
+          float predicted_error;
+          if (std::abs(roc) > 0.15f || std::abs(error) > 10.0f) {
+              predicted_error = set_point - predicted_temp;
+              ESP_LOGD("SMITH", "Prédiction active — roc:%.3f Pred:%.1f", roc, predicted_temp);
+          } else {
+              predicted_error = error;
+              ESP_LOGD("SMITH", "Zone morte roc:%.3f — erreur réelle utilisée", roc);
+          }
+
+          // ================================================================
+          // NORMALISATION PAR LA PLAGE DU PROCÉDÉ — Style industriel PROVOX
+          // Kp = gain pur  (ex: 0.90 → P=9% pour erreur=10% de la plage)
+          // Ki = répétitions/minute (ex: 0.27 rép/min)
+          // plage_procede = SP_max - SP_min = 600 - 150 = 450°F
+          // Comportement mathématiquement identique à l'ancien code —
+          // seules les unités de Kp et Ki changent.
+          // Ancien code : P = 0.002 x error
+          // Nouveau code : P = 0.90 x (error / 450) = 0.002 x error ✅
+          // ================================================================
+          float plage = id(plage_procede);
+
+          // Erreur normalisée sur la plage du procédé (0.0 à 1.0)
+          float predicted_error_norm = predicted_error / plage;
+
+          // --- Terme P normalisé ---
+          // Kp=0.90 + erreur=45°F sur 450°F → P = 0.90 x (45/450) = 9%
+          float p_term = id(base_kp) * predicted_error_norm;
+
+          // --- Terme I en répétitions/minute (parallèle) avec Anti-windup ---
+          float potential_integral = id(pid_integral) + (predicted_error_norm * (dt / 60.0f));
+          float i_raw = id(base_ki) * potential_integral;
+
+          // Détection de saturation basée sur la sortie totale estimée (P + I)
+          float sortie_estimee = p_term + i_raw;
+          bool sature_bas = (sortie_estimee <= id(pid_sortie_min));
+          bool sature_haut = (sortie_estimee >= id(pid_sortie_max));  
+          
+          // dt converti en minutes → Ki s'exprime en rép/min
+          // Ki=0.27 rép/min : après 1 min d'erreur de plage complète → I = 0.27 x 1.0 = 27%
+          // Ancien code : pid_integral += predicted_error x dt (secondes)
+          //               i_raw = 0.00001 x pid_integral
+          // Nouveau code : pid_integral += (predicted_error/450) x (dt/60)
+          //                i_raw = 0.27 x pid_integral
+          // Résultat identique : 0.00001 x error x dt = 0.27 x (error/450) x (dt/60) ✅
+
+          // On n'autorise l'intégration que si on ne sature pas OU si on s'en éloigne
+          // Note: on utilise predicted_error_norm pour être cohérent avec le Smith
+          
+          // Flag démarrage (Indispensable pour décoller du plancher)
+          bool demarrage = (id(smith_output_level) <= id(pid_sortie_min) && error > 5.0f);
+          
+          // On intègre si : démarrage OU (non saturé dans la direction de l'erreur RÉELLE)
+          bool integrer = demarrage || ((!sature_bas || error > 0.0f) && (!sature_haut || error < 0.0f));
+
+          if (integrer) {
+              id(pid_integral) = potential_integral;
+          }     
+
+          // ===============================================
+          // BORNE ABSOLUE DE L'INTÉGRALE (Back-Calculation)
+          // ===============================================
+          i_raw = id(base_ki) * id(pid_integral);
+
+          // Borne Haute
+          if (i_raw > id(pid_sortie_max)) {
+              id(pid_integral) = id(pid_sortie_max) / id(base_ki);
+          }
+
+          // Borne Basse : Empêche l'intégrale de "creuser" sous le minimum
+          // On ajuste l'intégrale pour que (P + I) ne soit jamais < pid_sortie_min
+          float i_min_requis = id(pid_sortie_min) - p_term;
+          if (i_raw < i_min_requis) {
+              id(pid_integral) = i_min_requis / id(base_ki);
+          }
+          
+          float i_term = i_raw;
+
+          // --- Terme D --- DÉSACTIVÉ
+          float d_term = 0.0f;
+
+          // --- Sortie brute ---
+          float smith_raw = p_term + i_term + d_term;
+
+          // --- Borne sur smith_raw ---
+          // Protection finale avant envoi vers le pipeline EMA.
+          // Le bornage est répété dans smith_out write_action avant l'EMA
+          // pour garantir que le filtre ne lisse jamais hors des limites.
+          //if (smith_raw < 0.10f) smith_raw = 0.10f;
+          //if (smith_raw > 0.50f) smith_raw = 0.50f;
+          if (smith_raw < id(pid_sortie_min)) smith_raw = id(pid_sortie_min);
+          if (smith_raw > id(pid_sortie_max)) smith_raw = id(pid_sortie_max);
+
+          // --- Mémorisation pour le prochain cycle ---
+          if (std::abs(current_temp - id(pid_last_temp)) > 0.05f) {
+              id(pid_last_temp) = current_temp;
+          }
+          id(pid_last_error) = predicted_error;
+
+          ESP_LOGD("SMITH",
+              "PV:%.1f SP:%.1f Pred:%.1f roc:%.3f | ErrR:%.1f ErrP:%.1f ErrN:%.4f | "
+              "P:%.3f I:%.3f dt:%.2fs | Raw:%.3f int:%.4f",
+              current_temp, set_point, predicted_temp, roc,
+              error, predicted_error, predicted_error_norm,
+              p_term, i_term, dt, smith_raw,
+              id(pid_integral));
+
+          // --- Envoi vers le pipeline de lissage ---
+          // Le bornage pid_sortie_min/max est aussi appliqué dans
+          // smith_out write_action avant le filtre EMA
+          id(smith_out).set_level(smith_raw);
+
+#-------------------------------------------
+# Police de caractère
+#-------------------------------------------
+font:
+  - file: "gfonts://Material Symbols Outlined"
+    id: icon_font_lg
+    size: 64
+    glyphs:
+      - "\uF537" # Symbole du radiateur (Chauffage Boitier)
+      - "\uF168" # mode_fan (Ventilateur)
+      - "\uE3E4" # flare (Allumeur)
+      - "\uF64C" # rule_settings (Vis)
+
+  - file: "gfonts://Roboto"
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€'
+    id: roboto_60
+    size: 60
+
+  - file: "gfonts://Roboto"
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€'
+    id: roboto_32
+    size: 32
+
+  - file: "gfonts://Roboto"
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€'
+    id: roboto_25
+    size: 25
+
+  - file: "gfonts://Roboto"
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€Ω'
+    id: roboto_22
+    size: 22
+
+  - file: 'fonts/roboto-400-v1.ttf'
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€'
+    id: roboto_20
+    size: 20
+
+  - file: 'fonts/roboto-400-v1.ttf'
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€'
+    id: roboto_med
+    size: 18
+    bpp: 4
+    extras:
+      - file: "fonts/materialdesignicons-webfont.ttf"
+        glyphs: 
+          - ${mdi_chevron_up}
+          - ${mdi_chevron_down}
+
+  - file: "./fonts/Montserrat-Bold.ttf"
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüÿ€▼'
+    id: montserrat_bold_fr_80
+    size: 80
+    bpp: 4
+
+  - file: "gfonts://Montserrat@400" # ESPHome téléchargera la version Regular par défaut
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€▼'
+    id: montserrat_fr_36
+    size: 36
+    bpp: 4
+
+  - file: "./fonts/Montserrat-Bold.ttf"
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüÿ€▼'
+    id: montserrat_36 # Pour le bas de page, ne pas changer pour conserver l'affichage des icones de navigation
+    size: 36
+    bpp: 4
+
+  - file: "./fonts/Montserrat-Bold.ttf"
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüÿ€▼'
+    id: montserrat_bold_fr_36
+    size: 36
+    bpp: 4
+
+  - file: "gfonts://Montserrat@400" # ESPHome téléchargera la version Regular par défaut
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€▼'
+    id: montserrat_fr_30
+    size: 30
+    bpp: 4
+
+  - file: "./fonts/Montserrat-Bold.ttf"
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüÿ€▼'
+    id: montserrat_bold_fr_30
+    size: 30
+    bpp: 4
+
+  - file: "gfonts://Montserrat@400" # ESPHome téléchargera la version Regular par défaut
+    glyphs: ' !"#$%&''()°*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ÀàÂâÆæÇçÉéÈèÊêËëÎîÏïÔôŒœÙùÛûÜüŸÿ€▼'
+    id: montserrat_fr_14
+    size: 14
+    bpp: 4
+
+  # Fonts pour affichage de l'heure  
+  - file: "gfonts://Oswald@700"
+    id: font_time
+    size: 40
+    bpp: 4
+
+#-------------------------------------------
+# Paramètrage de l'écran tactile gt911
+#-------------------------------------------
+touchscreen:
+  platform: gt911
+  id: my_touchscreen
+  display: lcd7b
+  i2c_id: bus_a
+  interrupt_pin: GPIO4
+  # setup_priority abaissée volontairement : on retarde l'exécution du
+  # setup() du GT911 (qui pulse reset_pin via le hub CH32V003 en I2C)
+  # pour laisser au CH32V003 le temps de terminer son propre boot
+  # interne après une remise sous tension. Sans ce délai, lors d'un
+  # retour de courant après une panne, le hub peut ne pas encore
+  # répondre sur I2C au moment où ce setup() s'exécute, ce qui laisse
+  # le GT911 sans reset correct et donc insensible au toucher, même si
+  # l'écran s'affiche normalement et que le reste démarre bien.
+  setup_priority: -100
+  reset_pin:
+    waveshare_io_ch32v003: waveshare_io_hub
+    number: 1
+    mode: OUTPUT
+  on_touch:
+    then:
+      - script.execute: stop_antiburn
+      - script.execute: start_antiburn_temporise    
+
+#-------------------------------------------
+# Paramètrage de l'écran
+#-------------------------------------------
+display:
+  - platform: mipi_rgb # ancien:rpi_dpi_rgb
+    id: lcd7b
+    model: RPI
+    # Panel geometry + pixel clock
+    dimensions: { width: 1024, height: 600 }
+    pclk_frequency: 30MHz
+    pclk_inverted: true
+    color_order: RGB
+    rotation: 0
+
+    # Sync timings (work well on this panel)
+    hsync_pulse_width: 20
+    hsync_back_porch: 160
+    hsync_front_porch: 160
+    vsync_pulse_width: 3
+    vsync_back_porch: 23
+    vsync_front_porch: 12
+
+    # Control pins
+    de_pin: 5
+    pclk_pin: 7
+    hsync_pin: { number: 46, ignore_strapping_warning: true }
+    vsync_pin: { number: 3,  ignore_strapping_warning: true }
+
+    # Panel reset is routed through Waveshare CH32V003
+    reset_pin:
+      waveshare_io_ch32v003: waveshare_io_hub
+      number: 3
+
+    # RGB565 data bus (LSB→MSB) — verified mapping for 7B
+    data_pins:
+      red:   [1, 2, 42, 41, 40]
+      green: [39, 0, 45, 48, 47, 21]
+      blue:  [14, 38, 18, 17, 10]
+
+    # Draw once per second (could be 'never' + on_boot fill)
+    update_interval: 1s
+
+
+#-------------------------------------------
+# Affichage des pages graphique
+#-------------------------------------------
+lvgl:
+  displays: [lcd7b]
+  # 2. Déclencheur global (au même niveau que displays)
+
+  style_definitions:
+# Style pour boutons inactif
+    - id: style_disabled
+      bg_color: 0x808080 # Gris moyen
+      bg_opa: COVER
+
+# Style pour entête et bas de page
+    - id: header
+      bg_color: 0x002D42
+      bg_grad_color: 0x005782
+      bg_grad_dir: VER
+      bg_opa: COVER
+      border_opa: TRANSP
+      radius: 0
+      pad_all: 0
+      pad_row: 0
+      pad_column: 0
+      border_color: 0x0077b3
+      text_color: 0xFFFFFF
+      text_font: montserrat_fr_36
+      width: 100%
+      height: 40
+
+# Style pour entête et bas de page
+    - id: footer
+      bg_color: 0x005782
+      bg_grad_color: 0x002D42
+      bg_grad_dir: VER
+      bg_opa: COVER
+      border_opa: TRANSP
+      radius: 0
+      pad_all: 0
+      pad_row: 0
+      pad_column: 0
+      border_color: 0x0077b3
+      text_color: 0xFFFFFF
+      text_font: montserrat_36
+      width: 100%
+      height: 40
+
+    - id: style_transparent
+      bg_opa: TRANSP # Rend l'arrière-plan transparent
+      border_width: 0 # Supprime les bordures
+      shadow_width: 0 # Supprime l'ombre
+      outline_width: 0 # Supprime la doublure de la bordure
+      radius: 0 # Supprimer l'arrondi si désiré
+
+# Style objet sur rectangle arrondi sur fond gris avec ombre
+    - id: style_obj_fond_gris
+      bg_opa: COVER
+      bg_color: ${color_bg_obj}
+      border_color: ${color_black}
+      border_width: 3
+      shadow_color: ${color_grey_moy}
+      shadow_opa: 100%
+      shadow_width: 10
+      shadow_offset_x: 7
+      shadow_offset_y: 7 
+      radius: 20 
+      pad_all: 0
+
+# Style bouton sur rectangle arrondi avec ombre
+    - id: style_btn
+      border_color: ${color_black}
+      border_width: 3
+      shadow_color: ${color_grey_moy}
+      shadow_opa: 100%
+      shadow_width: 10
+      shadow_offset_x: 5
+      shadow_offset_y: 5 
+      radius: 10 
+      pad_all: 0
+
+# Boutons de navigation dans le bas de chaque page
+  top_layer:
+    widgets:
+      # 1. Le rideau noir (1024x600)
+      - obj:
+          id: antiburn_curtain
+          width: 1024
+          height: 600
+          hidden: true
+          bg_color: 0x000000  # Noir pur
+          bg_opa: 100%
+          border_width: 0
+          radius: 0
+
+      # 2. Le logo qui bouge
+      - obj:
+          id: container_antiburn
+          width: 250
+          height: 200
+          hidden: true
+          bg_opa: 0%
+          border_width: 0
+          # Ajoutez ces lignes pour supprimer les marges internes :
+          pad_all: 0
+          pad_top: 0
+          pad_bottom: 0
+          pad_left: 0
+          pad_right: 0
+          widgets:
+            - image:
+                src: img_logo_antiburn
+                # Optionnel : forcer l'alignement au centre
+                align: center 
+
+      - buttonmatrix:
+          align: bottom_mid
+          styles: footer
+          pad_all: 0
+          outline_width: 0
+          id: nav_matrix
+          items:
+            styles: footer
+          rows:
+            - buttons:
+              - id: page_prev
+                text: "\uF053"
+                on_press:
+                  then:
+                    lvgl.page.previous:
+              - id: page_home
+                text: "\uF015"
+                on_press:
+                  then:
+                    lvgl.page.show: main_page
+              - id: page_next
+                text: "\uF054"
+                on_press:
+                  then:
+                    - lvgl.page.next:
+
+    # Heure courante
+      - label:
+          id: lbl_current_time
+          x: 890
+          y: 545
+          text_font: font_time
+          text: " "
+
+  bg_color: ${color_bg}
+
+  # Début des pages graphique
+  pages:
+    - id: main_page
+      widgets:
+        # --- Entête de la page ---
+        - obj:
+            align: TOP_MID
+            styles: header
+            widgets:
+              - label:
+                  text_font: montserrat_fr_36
+                  text: "Contrôle"
+                  align: CENTER
+                  text_align: CENTER
+                  text_color: 0xFFFFFF
+
+        # Affichage de l'état de la connection wifi
+        - label:
+            id: lbl_wifi
+            text_color: 0xFFFFFF
+            text: "WiFi..."
+            x: 10
+            y: 4
+        - label:
+            id: lbl_ip
+            text_color: 0xFFFFFF
+            text: "IP: en attente"
+            x: 60
+            y: 4   
+
+            # --- ZONE CONTRÔLE TEMPÉRATURE DU BBQ ---
+        - obj:
+            id: controle_pid
+            styles: style_obj_fond_gris
+            pad_all: 0
+            x: 10
+            y: 50
+            width: 475
+            height: 500
+            bg_opa: 100%
+            widgets:
+              # ARC 1 : Affiche le PV (remplissage orange, pas de bouton)
+              - arc:
+                  id: arc_pv
+                  align: CENTER
+                  y: 30
+                  width: 400
+                  height: 400
+                  arc_width: 30
+                  min_value: 150
+                  max_value: 500
+                  value: 180 # Sera mis à jour par le PV
+                  adjustable: false
+                  arc_color: 0x292929 # Fond gris
+                  indicator:
+                    arc_color: 0xFF6F22 # Remplissage orange
+                  knob:
+                    bg_opa: 0% # Cache le bouton de cet arc                         
+              # ARC 2 : Affiche le SP (bouton blanc, pas de remplissage)
+              - arc:
+                  id: arc_sp
+                  align: CENTER
+                  y: 30
+                  adjustable: true
+                  value: 0 # relié au (PV)
+                  min_value: 150
+                  max_value: 500
+                  width: 400
+                  height: 400
+                  arc_width: 30
+                  arc_color: 0x292929
+                  indicator:
+                    arc_opa: 0% # Cache le remplissage orange de l'arc de (SP)
+                    #arc_color: 0xFF6F22 # Remplissage orange (PV)
+                    arc_width: 30
+                  knob:
+                    bg_color: 0xFFFFFF # Rond Blanc relié au (SP)
+                  on_value:
+                    then:
+                      - climate.control: 
+                          id: bbq_pid
+                          # On arrondit la valeur glissée (x) au multiple de 5 le plus proche
+                          target_temperature: !lambda "return (round(x / 5.0) * 5.0);"
+
+                      - lambda: |-
+                          // On récupère la valeur arrondie pour la suite
+                          float target_arrondi = round(x / 5.0) * 5.0;
+                          auto *lbl = id(lbl_selection_live);
+
+                          // 1. Forcer l'arc à se recaler visuellement sur le multiple de 5
+                          lv_arc_set_value(id(arc_sp), (int)target_arrondi);
+
+                          // 2. Rendre le label visible et mettre à jour le texte
+                          lv_obj_clear_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+                          lv_label_set_text(lbl, esphome::str_sprintf("Cible: %.0f°F", target_arrondi).c_str());
+
+                          // 3. Mettre à jour le dropdown si c'est un preset
+                          std::string val_str = esphome::str_sprintf("%.0f°F", target_arrondi);
+                          id(select_temp_preset).set_selected_text(val_str.c_str(), LV_ANIM_ON);
+
+                      - script.execute: cacher_label_selection
+
+              - label:
+                  id: lbl_titre
+                  align: TOP_MID
+                  y: 5
+                  text: "Température du BBQ"
+                  text_font: montserrat_bold_fr_36
+
+              - dropdown:
+                  id: select_temp_preset
+                  text_font: montserrat_bold_fr_30
+                  symbol: "▼" # Le triangle reste à droite par défaut
+                  # On ajoute l'unité °F directement dans les options
+                  options: ["150°F", "180°F", "200°F", "225°F", "250°F", "275°F", "300°F", "325°F", "350°F", "375°F", "400°F", "425°F", "450°F", "475°F", "500°F"]
+                  width: 140 # Largeur ajustée pour ajout de °F à la fin
+                  height: 65
+                  align: CENTER
+                  y: -60
+                  on_click: 
+                    lambda: |-
+                      auto * list = lv_dropdown_get_list(id(select_temp_preset).obj);
+                      if (list != nullptr) {
+                          lv_obj_set_style_text_font(list, montserrat_fr_30, 0);
+                      }
+                  on_value:
+                    then:
+                      - lambda: |-
+                          // 1. Récupérer le texte (ex: "180°F")
+                          std::string selected_text = id(select_temp_preset).get_selected_text();
+
+                          // 2. Conversion intelligente
+                          // atof lit les chiffres et s'arrête net dès qu'il voit "°"
+                          float target = std::atof(selected_text.c_str());
+
+                          // 3. Mettre à jour le thermostat (PID)
+                          auto call = id(bbq_pid).make_call();
+                          call.set_target_temperature(target);
+                          call.perform();  
+                               
+                          // 4. Synchroniser l'Arc
+                          lv_arc_set_value(id(arc_sp), (int)target);
+
+                          ESP_LOGD("DROPDOWN", "Texte: %s -> Float: %.1f", selected_text.c_str(), target);
+
+              - label:
+                  id: lbl_pv
+                  align: CENTER
+                  text: "--°F"
+                  text_font: montserrat_bold_fr_80
+                  text_color: ${color_pv}
+                  y: 30  
+
+              # Bouton MOINS (-)
+              - button:
+                  align: CENTER
+                  x: -50   # Positionné à gauche sous l'arc (ajuste selon ton goût)
+                  y: 110
+                  width: 70
+                  height: 70
+                  radius: 35
+                  bg_color: ${color_bg_obj2}
+                  border_width: 2
+                  border_color: 0x000000
+                  widgets:
+                    - label: { text: "-", align: CENTER, text_font: roboto_60, text_color: 0x000000 }
+                  on_click:
+                    - climate.control:
+                        id: bbq_pid
+                        target_temperature: !lambda "return id(bbq_pid).target_temperature - 5;"
+                    # --- METS À JOUR L'ARC, LE DROPDOWN ET LA VALEUR SÉLECTIONNÉ NON PRÉSETTÉ ---
+                    - lambda: |-
+                        float target = id(bbq_pid).target_temperature;
+                        // 1. Synchroniser l'Arc
+                        lv_arc_set_value(id(arc_sp), (int)target);
+
+                        // 2. Vérifier si c'est un preset
+                        std::vector<int> presets = {150, 180, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500};
+                        bool is_preset = std::find(presets.begin(), presets.end(), (int)target) != presets.end();
+
+                        if (is_preset) {
+                            // C'est un preset : on met à jour le dropdown et cache le label live
+                            std::string val_str = esphome::str_sprintf("%.0f°F", target);
+                            id(select_temp_preset).set_selected_text(val_str.c_str(), LV_ANIM_ON);
+                            lv_obj_add_flag(id(lbl_selection_live), LV_OBJ_FLAG_HIDDEN);
+                        } else {
+                            // Pas un preset : on affiche le label live avec la valeur
+                            lv_obj_clear_flag(id(lbl_selection_live), LV_OBJ_FLAG_HIDDEN);
+                            lv_label_set_text(id(lbl_selection_live), esphome::str_sprintf("Cible: %.0f°F", target).c_str());
+                        }
+                    # Optionnel : cache le label après 3 secondes s'il est affiché
+                    - script.execute: cacher_label_selection
+
+              # Bouton PLUS (+)
+              - button:
+                  align: CENTER
+                  x: 50  # Positionné à droite sous l'arc
+                  y: 110
+                  width: 70
+                  height: 70
+                  radius: 35
+                  bg_color: ${color_bg_obj2}
+                  border_width: 2
+                  border_color: 0x000000
+                  widgets:
+                    - label: { text: "+", align: CENTER, text_font: roboto_60, text_color: 0x000000 }
+                  on_click:
+                    - climate.control:
+                        id: bbq_pid
+                        target_temperature: !lambda "return id(bbq_pid).target_temperature + 5;"
+                    # --- METS À JOUR L'ARC, LE DROPDOWN ET LA VALEUR SÉLECTIONNÉ NON PRÉSETTÉ ---
+                    - lambda: |-
+                        float target = id(bbq_pid).target_temperature;
+                        // 1. Synchroniser l'Arc
+                        lv_arc_set_value(id(arc_sp), (int)target);
+
+                        // 2. Vérifier si c'est un preset
+                        std::vector<int> presets = {150, 180, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500};
+                        bool is_preset = std::find(presets.begin(), presets.end(), (int)target) != presets.end();
+
+                        if (is_preset) {
+                            // C'est un preset : on met à jour le dropdown et cache le label live
+                            std::string val_str = esphome::str_sprintf("%.0f°F", target);
+                            id(select_temp_preset).set_selected_text(val_str.c_str(), LV_ANIM_ON);
+                            lv_obj_add_flag(id(lbl_selection_live), LV_OBJ_FLAG_HIDDEN);
+                        } else {
+                            // Pas un preset : on affiche le label live avec la valeur
+                            lv_obj_clear_flag(id(lbl_selection_live), LV_OBJ_FLAG_HIDDEN);
+                            lv_label_set_text(id(lbl_selection_live), esphome::str_sprintf("Cible: %.0f°F", target).c_str());
+                        }
+                    # Optionnel : cache le label après 3 secondes s'il est affiché
+                    - script.execute: cacher_label_selection
+
+              - label:
+                  id: lbl_selection_live
+                  align: TOP_MID
+                  y: 38 
+                  text: "Réglage..."
+                  hidden: true # Caché par défaut
+                  text_font: montserrat_bold_fr_30
+                  text_color: 0xFFFFFF
+
+
+              # Ventilateur (mode_fan)
+              - obj:
+                  id: box_fan_icon
+                  border_color: ${color_grey_moy}
+                  border_width: 2
+                  radius: 5
+                  pad_all: 0
+                  align: BOTTOM_MID
+                  x: -75
+                  y: -10
+                  width: 65
+                  height: 65
+                  bg_opa: 0% 
+                  widgets:
+                    - label: 
+                        id: lbl_fan_icon
+                        align: CENTER
+                        text: "\uF168"
+                        text_color: ${color_off}
+                        text_font: icon_font_lg
+
+              # Allumeur (flare)
+              - obj:
+                  id: box_igniter_icon
+                  border_color: ${color_grey_moy}
+                  border_width: 2
+                  radius: 5 
+                  pad_all: 0
+                  align: BOTTOM_MID
+                  x: 0
+                  y: -10
+                  width: 65
+                  height: 65
+                  bg_opa: 0% 
+                  widgets:
+                    - label: 
+                        id: lbl_igniter_icon
+                        align: CENTER
+                        text: "\uE3E4" # Note: 'flare' est généralement E3E4
+                        text_color: ${color_off}
+                        text_font: icon_font_lg
+
+              # Vis d'alimentation (rule_settings)
+              - obj:
+                  id: box_auger_icon
+                  border_color: ${color_grey_moy}
+                  border_width: 2
+                  radius: 5 
+                  pad_all: 0
+                  align: BOTTOM_MID
+                  x: 75
+                  y: -10
+                  width: 65
+                  height: 65
+                  bg_opa: 0% 
+                  widgets:
+                    - label: 
+                        id: lbl_auger_icon
+                        align: CENTER
+                        text: "\uF64C" # Note: 'rule_settings' est F64C
+                        text_color: ${color_off}
+                        text_font: icon_font_lg             
+
+        # --- Bouton de Mode Fumée ---
+        - button:
+            id: btn_smoke_toggle
+            styles: style_btn
+            x: 785
+            y: 360
+            width: 200
+            height: 50
+            bg_color: 0x607D8B # Couleur ardoise
+            on_click:
+              then:
+                - if:
+                    condition:
+#                      lambda: |-
+#                        // Autorisé si en Allumage, en Régulation (HEAT) ou si déjà en mode Fumée
+#                        return (id(is_igniting) || id(bbq_pid).mode == climate::CLIMATE_MODE_HEAT || id(smoke_mode_active));
+                      lambda: |-
+                        // Autorisé si en Allumage, en Régulation (HEAT) ou si déjà en mode Fumée
+                        return (id(bbq_pid).mode == climate::CLIMATE_MODE_HEAT || id(smoke_mode_active));
+                    then:
+                      - lambda: |-
+                          id(smoke_mode_active) = !id(smoke_mode_active);
+
+                          if (id(smoke_mode_active)) {
+                              // --- PASSAGE EN MODE FUMÉE ---
+                              lv_obj_clear_flag(id(cont_smoke), LV_OBJ_FLAG_HIDDEN);
+                              // On coupe le PID pour qu'il ne se batte pas avec le slider
+                              auto call = id(bbq_pid).make_call();
+                              call.set_mode("OFF");
+                              call.perform();
+                          } else {
+                              // --- RETOUR AU MODE PID ---
+                              lv_obj_add_flag(id(cont_smoke), LV_OBJ_FLAG_HIDDEN);
+
+                              // 1. Reset intégrale PID natif
+                              id(bbq_pid).reset_integral_term();
+
+                              // 2. Reset Smith si actif — évite une reprise
+                              //    avec des valeurs obsolètes du mode fumée
+                              if (id(smith_active)) {
+                                  id(pid_integral)   = 0.0f;
+                                  id(pid_last_error) = 0.0f;
+                                  id(pid_last_temp)  = 0.0f;
+                                  id(pid_last_time)  = 0;
+                                  id(smith_roc_last) = 0.0f;
+                                  // Initialise l'EMA à la valeur de fumée courante
+                                  // pour une transition douce sans rampe parasite
+                                  id(smith_output_lisse).publish_state(id(smoke_intensity));
+                                  id(smith_output_level) = id(smoke_intensity);
+                                  ESP_LOGI("SMITH", "Reset Smith — retour mode fumée → PID. EMA init: %.2f", id(smoke_intensity));
+                              }
+
+                              // 3. Relance le PID en HEAT
+                              auto call = id(bbq_pid).make_call();
+                              call.set_mode("HEAT");
+                              call.perform();
+                          }
+                    
+                      # Après avoir changé les modes, on demande au routeur de mettre la vis à jour
+                      - script.execute: update_auger_routing
+                    else:
+                      - logger.log: "Mode Manuel/Fumée refusé : le BBQ est arrêté"
+            widgets:
+              - label:
+                  text: "MODE MAN/FUMÉE"
+                  align: CENTER
+                  text_font: roboto_20
+
+# --- ZONE RÉGLAGE MODE FUMÉE  ---
+        - obj:
+            id: cont_smoke
+            styles: style_obj_fond_gris
+            x: 716
+            y: 420
+            width: 300
+            height: 130
+            bg_opa: 100%
+            hidden: true
+            widgets:
+              - label:
+                  text: "INTENSITÉ FUMÉE"
+                  text_font: roboto_20
+                  align: TOP_MID
+              - label:
+                  id: lbl_smoke_val
+                  text: "Sél. intensité"
+                  text_font: roboto_med
+                  align: CENTER
+                  y: -25
+              - dropdown:
+                  id: dropdown_smoke
+                  width: 220
+                  align: BOTTOM_MID
+                  text_font: roboto_med
+                  symbol: ${mdi_chevron_up} # Icône de chevron vers le haut pour indiquer le sens d'ouverture de la liste
+                  y: -15
+                  options:
+                    - "5%  Fumee maximum"
+                    - "7%  Fumee tres forte"
+                    - "9%  Fumee forte"
+                    - "11% Fumee moyenne"
+                    - "13% Fumee legere"
+                    - "15% Fumee minimal"
+                    - "Charge 20%"
+                    - "Charge 30%"
+                    - "Charge 40%"
+                    - "Charge 50%"
+                  selected_index: 3   # Défaut : 11% fumée moyenne
+                  on_value:
+                    then:
+                      - lambda: |-
+                          // Correspondance index → valeur PWM
+                          // Index 0 = 5%  (fumée max, combustion lente)
+                          // Index 5 = 15% (fumée min, combustion vive)
+                          // Index 6 à 9 = Charge de vis de 20% à 50%
+                          const float valeurs[] = {0.05f, 0.07f, 0.09f, 0.11f, 0.13f, 0.15f, 0.20f, 0.30f, 0.40f, 0.50f};
+                          id(smoke_intensity) = valeurs[x];
+
+                          // Mise à jour du label d'affichage
+                          const char* labels[] = {
+                              "Fumée maximal   (5%)",
+                              "Fumée très forte(7%)",
+                              "Fumée forte     (9%)",
+                              "Fumée moyenne   (11%)",
+                              "Fumée légère    (13%)",
+                              "Fumée mininimal (15%)",
+                              "Charge 20%",
+                              "Charge 30%",
+                              "Charge 40%",
+                              "Charge 50%"
+                          };
+                          lv_label_set_text(id(lbl_smoke_val), labels[x]);
+
+                          // Applique immédiatement si mode fumée actif
+                          if (id(smoke_mode_active)) {
+                              id(update_auger_routing).execute();
+                          }
+
+        # --- ZONE ÉTAT DES COMPOSANTS ---
+        - obj:
+            styles: style_obj_fond_gris          
+            x: 665
+            y: 50
+            width: 350
+            height: 300
+            bg_opa: 100%     # Transparent
+            #layout: vertical
+            widgets:
+              - label: { x: 10, y: 10, id: lbl_meat1, text: "Aliment 1: --°F", text_font: roboto_25 }
+              - label: { x: 10, y: 60, id: lbl_meat2, text: "Aliment 2: --°F", text_font: roboto_25 }
+              - label: { x: 10, y: 110, id: lbl_fan, text: "Ventilateur: --", text_font: roboto_25 }
+              - label: { x: 10, y: 160, id: lbl_auger, text: "Vis: --", text_font: roboto_25 }
+              - label: { x: 10, y: 210, id: lbl_duty, text: "Charge mode PID: --%", text_font: roboto_25 }
+              - label: { x: 10, y: 260, id: lbl_mode, text: "Mode: Veille", text_font: roboto_25 }
+
+        # --- BOUTONS DÉPART ---
+        - button:
+            id: btn_start
+            styles: style_btn
+            x: 500
+            y: 50
+            width: 150
+            height: 100
+            bg_color: 0x2E7D32
+            # 1. Quand on appuie, on lance un chrono de 3s
+            on_press:
+              then:
+                - if:
+                    condition:
+                      lambda: |-
+                        return !(id(is_igniting) || id(is_cooling) || id(bbq_pid).mode == climate::CLIMATE_MODE_HEAT);
+                    then:
+                      - script.execute: check_long_press
+            # 2. Si on relâche avant la fin du script, le script s'arrête (donc rien ne se passe)
+            on_release:
+              then:
+                - script.stop: check_long_press
+            widgets:
+              - label:
+                  text: "DÉPART\n (3 sec)"
+                  align: CENTER
+                  text_font: roboto_32
+
+        # --- BOUTONS ARRÊT ---
+        - button:
+            id: btn_stop
+            styles: style_btn
+            x: 500
+            y: 160
+            width: 150
+            height: 100
+            bg_color: 0xC62828
+            on_click: 
+              then:
+                - if:
+                    condition:
+                      lambda: |-
+                        // On autorise le STOP si on est en Allumage OU en Régulation (HEAT)
+                        return (id(is_igniting) || id(bbq_pid).mode == climate::CLIMATE_MODE_HEAT);
+                    then:
+                      # Affiche la boîte de message de confirmation
+                      - lvgl.widget.show:
+                          id: stop_confirm_box
+                    else:
+                      - logger.log: "Bouton STOP ignoré : le BBQ n'est pas actif."
+            widgets: 
+              - label: 
+                  id: lbl_stop_text
+                  text: "ARRÊT"
+                  align: CENTER
+                  text_font: roboto_32
+
+        # --- BOUTONS AMORÇE ---
+        - button:
+            id: btn_prime
+            styles: style_btn
+            x: 500
+            y: 270
+            width: 150
+            height: 100
+            bg_color: 0x1877F2 # Bleu initial
+          
+            # --- COMPORTEMENT MAINTENU (Appui continu) ---
+            # Bloqué pendant is_cooling ET pre_cooldown_active : la purge
+            # d'urgence de la vis se fait maintenant via le bouton PURGE VIS
+            # dédié (avec allumeur + ventilateur automatiques), donc plus
+            # besoin que ce bouton reste actif pendant l'arrêt.
+            on_press:
+              then:
+                - if:
+                    condition:
+                      lambda: 'return (!id(safety_shutdown) && !id(pre_cooldown_active) && !id(is_cooling));'
+                    then:
+                      - globals.set: {id: manual_prime_active, value: 'true'}
+                      - output.set_level: {id: auger_slow_pwm, level: 1.0} # On force 100%
+                      - lvgl.obj.update: {id: btn_prime, bg_color: 0xff7f00}
+            on_release:
+              then:
+                - globals.set: {id: manual_prime_active, value: 'false'}
+                - if:
+                    condition:
+                      lambda: 'return !id(seq_amorcage_chrono).is_running();'
+                    then:
+                      - globals.set: {id: manual_prime_active, value: 'false'}
+                      - output.set_level: {id: auger_slow_pwm, level: 0.0} # On remet à 0% sans couper le composant
+                      - lvgl.obj.update: {id: btn_prime, bg_color: 0x1877F2}
+
+            # --- COMPORTEMENT CLIC (Chrono 10 SEC) ---
+            on_click:
+              then:
+                - if:
+                    condition:
+                      lambda: |-
+                        // Vérifie si le BBQ est en marche avant de lancer le script
+                        // (exclut aussi pre_cooldown_active : le PID régule encore
+                        // activement le feu pendant la descente vers 225°F)
+                        return ((id(is_igniting) || id(bbq_pid).mode == climate::CLIMATE_MODE_HEAT) &&
+                                !id(pre_cooldown_active));
+                    then:
+                      - script.execute: seq_amorcage_chrono
+                    else:
+                      - logger.log: "Amorçage auto (10s) refusé : BBQ à l'arrêt."
+
+            widgets:
+              - label:
+                  id: lbl_prime_text
+                  text: "AMORÇE"
+                  align: CENTER
+                  text_font: roboto_32
+
+        # --- BOUTON PURGE VIS ---
+        # En is_cooling (urgence) : vis 100% + allumeur, pour vider les fines
+        # particules bloquant le flux d'air (risque de braise remontant dans
+        # la trémie). À l'arrêt complet (remplissage) : vis 100% seulement,
+        # allumeur éteint. Marche/arrêt, avec plafond de sécurité et coupure
+        # automatique sur surchauffe (voir script seq_purge_vis).
+        - button:
+            id: btn_purge
+            styles: style_btn
+            x: 500
+            y: 380
+            width: 150
+            height: 100
+            bg_color: 0x1877F2 # Bleu initial (même code couleur que AMORÇE)
+            on_click:
+              then:
+                - if:
+                    condition:
+                      lambda: 'return id(purge_active);'
+                    then:
+                      # Deuxième appui = arrêt anticipé manuel
+                      - globals.set: {id: purge_active, value: 'false'}
+                      - logger.log: "Purge vis arrêtée manuellement"
+                    else:
+                      - if:
+                          condition:
+                            lambda: |-
+                              return (!id(safety_shutdown) && !id(is_igniting) &&
+                                      id(bbq_pid).mode != climate::CLIMATE_MODE_HEAT);
+                          then:
+                            - script.execute: seq_purge_vis
+                          else:
+                            - logger.log: "Purge vis refusée : BBQ en marche ou en erreur"
+            widgets:
+              - label:
+                  id: lbl_purge_text
+                  text: "PURGE\nVIS"
+                  align: CENTER
+                  text_font: roboto_32
+
+
+        # --- ICÔNE PTC (chauffage du boitier) ---
+        - label: 
+            id: lbl_ptc_icon
+            text: ""
+            x: 420
+            y: 450
+            text_font: icon_font_lg
+
+
+    - id: diag_page
+      widgets:
+        # --- Entête de la page ---
+        - obj:
+            align: TOP_MID
+            styles: header
+            widgets:
+              - label:
+                  text_font: montserrat_fr_36
+                  text: "Diagnostic"
+                  align: CENTER
+                  text_align: CENTER
+                  text_color: 0xFFFFFF
+
+        - obj:
+            width: 100%
+            height: 520
+            y: 40
+            layout:
+              type: flex
+              flex_flow: ROW_WRAP
+              flex_align_main: SPACE_EVENLY
+              flex_align_cross: CENTER
+            widgets:
+              # --- BLOC AFFICHAGE DES ERREURS ---
+              - obj:
+                  width: 300
+                  height: 490
+                  bg_color: ${color_grey}
+                  layout: { type: flex, flex_flow: COLUMN }
+                  widgets:
+                    # --- Indicateurs d'erreurs ---
+                    - label: { text: "ERREURS", text_font: montserrat_bold_fr_36 }
+                    - label:
+                        id: lbl_diag_allumage
+                        text: "ALLUMAGE: OK"
+                        text_font: roboto_22
+                    - label:
+                        id: lbl_diag_surchauffe
+                        text: "TEMPÉRATURE: OK"
+                        text_font: roboto_22
+                    # --- Bouton de Réinitialisation ---
+                    - button:
+                        id: btn_reset_erreurs
+                        styles: style_btn
+                        width: 220
+                        height: 60
+                        bg_color: 0x424242
+                        on_click:
+                          then:
+                            - script.execute: reset_systeme_erreurs
+                        widgets:
+                          - label: { text: "RÉINITIALISER", align: CENTER, text_font: roboto_22 }
+
+              # --- BLOC AUTO-TUNE ---
+              - obj:
+                  width: 300
+                  height: 490
+                  bg_color: ${color_grey}
+                  layout: { type: flex, flex_flow: COLUMN }
+                  widgets:
+                    - label: { text: "CNTRL PID", text_font: montserrat_bold_fr_36 }
+                    - button:
+                        id: btn_start_autotune
+                        styles: style_btn
+                        width: 250
+                        height: 70
+                        bg_color: 0x424242
+                        on_press:
+                          then:
+                            - script.execute: check_long_press_autotune
+                        on_release:
+                          then:
+                            - script.stop: check_long_press_autotune
+                        widgets:
+                          - label: { text: "LANCER AUTO-TUNE\n(3 sec)", align: CENTER, text_font: roboto_22 }
+                    - label: { id: lbl_pid_kp, text: "P: --", text_font: roboto_22 }
+                    - label: { id: lbl_pid_ki, text: "I: --", text_font: roboto_22 }
+                    - label: { id: lbl_pid_kd, text: "D: --", text_font: roboto_22 }                          
+
+              # --- Valeurs Divers en temps réel ---
+              - obj:
+                  width: 300
+                  height: 490
+                  bg_color: ${color_grey}
+                  layout: { type: flex, flex_flow: COLUMN }
+                  widgets:
+                    - label: { text: "DIVERS", text_align: CENTER, text_font: montserrat_bold_fr_36 }
+                    - label: { id: lbl_res_sonde_1, text: "Rés. Sonde 1: --Ω", text_font: roboto_22 }
+                    - label: { id: lbl_res_sonde_2, text: "Rés. Sonde 2: --Ω", text_font: roboto_22 }
+                    - label: { id: lbl_res_sonde_bbq, text: "Rés. Sonde BBQ: --Ω", text_font: roboto_22 }
+                    - label: { id: lbl_volt_sonde_1, text: "Volt Sonde 1: --V", text_font: roboto_22 }
+                    - label: { id: lbl_volt_sonde_2, text: "Volt Sonde 2: --V", text_font: roboto_22 }
+                    - label: { id: lbl_volt_sonde_bbq, text: "Volt Sonde BBQ: --V", text_font: roboto_22 }
+                    - label: { id: lbl_granules_mm, text: "Capteur Trémie: --mm", text_font: roboto_22 }
+
+        # Zone affichage température et humidité extérieur
+        - obj:
+            styles: style_obj_fond_gris          
+            #x: 562
+            align: CENTER
+            x: 50
+            y: 100
+            width: 150
+            height: 90
+            bg_opa: 100%     # Transparent
+            #layout: vertical
+            widgets:
+              - label:
+                  text: "Temp.\nExt."
+                  align: TOP_LEFT
+                  x: 15
+                  y: 7
+              - label:
+                  id: temperature_ext
+                  align: BOTTOM_LEFT
+                  text_color: ${color_pv}
+                  text_font: roboto_22
+                  x: 10
+                  y: -10
+              - label:
+                  text: "Hum.\nExt."
+                  align: TOP_RIGHT
+                  x: -15
+                  y: 7
+              - label:
+                  id: humidite_ext
+                  align: BOTTOM_RIGHT  
+                  text_color: ${color_pv}
+                  text_font: roboto_22
+                  x: -10
+                  y: -10  
+
+        # Indicateur niveau de la trémie de granules
+        - obj:
+            styles: style_obj_fond_gris
+            align: CENTER
+            x: -85
+            y: 125
+            width: 65
+            height: 200
+            bg_opa: 100%
+            widgets:
+              - label:
+                  text_font: montserrat_fr_14
+                  text: "Niveau\nTrémie"
+                  align: TOP_MID
+                  y: 1
+              - label:
+                  text: "100%"
+                  align: TOP_MID
+                  #x: 15
+                  y: 33
+              - bar:
+                  align: TOP_MID
+                  y: 50
+                  width: 20
+                  height: 100
+                  id: niveau_tremie_bar
+                  min_value: 0
+                  max_value: 100
+                  value: !lambda "return (int)id(niveau_granules).state;"
+              - label:
+                  text: "0%"
+                  align: BOTTOM_MID
+                  y: -25
+              - label:
+                  id: lbl_text_pct_niveau_granules
+                  text: "-- %"
+                  text_color: ${color_pv}
+                  text_font: roboto_22
+                  align: BOTTOM_MID
+
+  msgboxes:
+    - id: start_confirm_box
+      title: "Confirmation"
+      close_button: false
+      widgets:
+        - label:
+            text: "Voulez-vous démarrer le BBQ ?"
+            align: CENTER
+            text_font: montserrat_fr_14
+            y: -70
+      buttons:
+        - text: "OUI"
+          pad_top: 30
+          pad_bottom: 30
+          pad_left: 30
+          pad_right: 30
+          text_font: montserrat_fr_30
+          on_click:
+            then:
+              - script.execute: seq_depart
+              - lvgl.widget.hide: start_confirm_box
+        - text: "NON"
+          pad_top: 30
+          pad_bottom: 30
+          pad_left: 30
+          pad_right: 30
+          text_font: montserrat_fr_30
+          on_click:
+            then:
+              - lvgl.widget.hide: start_confirm_box
+      bg_color: ${color_grey}
+      text_color: ${color_black}
+
+    - id: stop_confirm_box
+      title: "Confirmation"
+      close_button: false
+      widgets:
+        - label:
+            text: "Voulez-vous arrêter le BBQ ?"
+            align: CENTER
+            text_font: montserrat_fr_14
+            y: -20
+      buttons:
+        - text: "OUI"
+          pad_top: 40
+          pad_bottom: 40
+          text_font: montserrat_fr_30
+          on_click:
+            then:
+              - script.execute: seq_arret
+              - lvgl.widget.hide: stop_confirm_box
+        - text: "NON"
+          pad_top: 40
+          pad_bottom: 40
+          text_font: montserrat_fr_30
+          on_click:
+            then:
+              - lvgl.widget.hide: stop_confirm_box
+      bg_color: ${color_grey}
+      text_color: ${color_black}
+
+    - id: autotune_confirm_box
+      title: "Confirmation Autotune"
+      close_button: false
+      widgets:
+        - label:
+            text: "Démarrer l'Autotune du PID ?\nLe BBQ doit être en marche à 225°F"
+            align: CENTER
+            text_font: montserrat_fr_14
+            y: -20
+      buttons:
+        - text: "OUI"
+          pad_top: 40
+          pad_bottom: 40
+          text_font: montserrat_fr_30
+          on_click:
+            then:
+              - logger.log: "Démarrage Auto-tune à 225°F"
+              # On force le mode AUTO (HEAT_COOL) requis par la nouvelle version
+              - globals.set: {id: autotune_active, value: 'true'} # On lève le drapeau
+              - climate.control: {id: bbq_pid, mode: "HEAT"}
+              - climate.pid.autotune: bbq_pid
+              - lvgl.widget.hide: autotune_confirm_box
+        - text: "NON"
+          pad_top: 40
+          pad_bottom: 40
+          text_font: montserrat_fr_30
+          on_click:
+            then:
+              - lvgl.widget.hide: autotune_confirm_box
+      bg_color: ${color_grey}
+      text_color: ${color_black}
+
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          // On demande au contrôleur mcp_hub l'état physique de la pin 3
+          // La fonction digital_read du MCP retourne un booléen
+          bool etat_reel = id(mcp_hub).digital_read(3); 
+          id(vis_en_mouvement).publish_state(etat_reel);
+
+  - interval: 1s
+    then:
+
+      # Calcul Prédicteur de Smith (si actif)
+      # → smith_out → smith_output_lisse → smith_output_level
+      # → déclenche update_auger_routing via on_value de smith_output_lisse
+      - script.execute: update_smith_output
+
+      # Pour le mode PID natif (smith inactif), le routing est déjà
+      # déclenché par on_value de pid_output_lisse. Cet appel direct
+      # couvre les cas hors régulation (allumage, fumée, etc.)
+      - script.execute: update_auger_routing
+
+      # Température de la cuve avec gestion de sécurité si la sonde est déconnectée (NaN) ou < 0
+      - lvgl.label.update:
+          id: lbl_pv
+          text: !lambda |-
+            if (isnan(id(bbq_temp_pv).state) || id(bbq_temp_pv).state < 0) {
+              // On lève l'erreur pour Home Assistant
+              if (id(err_sonde_cuve).state == false) {
+                id(err_sonde_cuve).publish_state(true);
+              }
+              return "fail °F";
+            } else {
+              // On efface l'erreur si la sonde revient
+              if (id(err_sonde_cuve).state == true) {
+                id(err_sonde_cuve).publish_state(false);
+              }
+              return esphome::str_sprintf("%.0f°F", id(bbq_temp_pv).state);
+            }
+
+      # Sonde Aliment 1 avec gestion de sécurité si la sonde est déconnectée (NaN) ou < 0
+      - lvgl.label.update:
+          id: lbl_meat1
+          text: !lambda |-
+            if (isnan(id(meat_1).state) || id(meat_1).state < 0) return "Aliment 1: fail";
+            return esphome::str_sprintf("Aliment 1: %.1f°F", id(meat_1).state);
+
+      # Sonde Aliment 2 avec gestion de sécurité si la sonde est déconnectée (NaN) ou < 0
+      - lvgl.label.update:
+          id: lbl_meat2
+          text: !lambda |-
+            if (isnan(id(meat_2).state) || id(meat_2).state < -40) return "Aliment 2: fail";
+            return esphome::str_sprintf("Aliment 2: %.1f°F", id(meat_2).state);
+
+      # État du ventilateur
+      - lvgl.label.update:
+          id: lbl_fan
+          text: !lambda 'return (id(fan_relay).state ? std::string("Ventilateur: MARCHE") : std::string("Ventilateur: ARRET"));'
+
+      # État visuel de la vis (Vérifie si le PWM est actif)
+      - lvgl.label.update:
+          id: lbl_auger
+          text: !lambda |-
+            if (id(vis_en_mouvement).state) {
+              return "Vis: ROTATION";
+            } else {
+              return "Vis: PAUSE";
+            }
+
+      # Icône de chauffage (Toujours visible, couleur dynamique)
+      - lvgl.label.update:
+          id: lbl_ptc_icon
+          # On affiche l'icône en permanence
+          text: "\U0000F537"
+          # On définit la couleur dynamiquement avec les substitutions
+          text_color: !lambda |-
+            if (id(ptc_heater).state) {
+              return lv_color_hex(${color_heat});
+            } else {
+              return lv_color_hex(${color_off});
+            }
+
+      # Mise à jour Ventilateur
+      - lvgl.label.update:
+          id: lbl_fan_icon
+          text_color: !lambda 'return id(fan_relay).state ? lv_color_hex(${color_on}) : lv_color_hex(${color_off});'
+
+      # Mise à jour Allumeur
+      - lvgl.label.update:
+          id: lbl_igniter_icon
+          text_color: !lambda 'return id(igniter_relay).state ? lv_color_hex(${color_heat}) : lv_color_hex(${color_off});'
+
+      # Mise à jour Vis d'alimentation
+      - lvgl.label.update:
+          id: lbl_auger_icon
+          text_color: !lambda 'return id(vis_en_mouvement).state ? lv_color_hex(${color_on}) : lv_color_hex(${color_off});'
+
+      # Logique pour protection sur très haute température
+      - if:
+          condition: 
+            lambda: |-
+              float temp = id(bbq_temp_pv).state;
+              return id(fan_relay).state        // BBQ en fonction
+                  && temp > 600.0f             // Température critique
+                  && temp < 1000.0f;           // Valeur plausible (pas un défaut de sonde)
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(safety_shutdown);'
+                then:
+                  - script.execute: seq_emergency_stop
+
+      # Vérifie si présence d'erreur et met le texte en rouge si oui
+      - lambda: |-
+          // Si erreur d'allumage active
+          if (id(err_allumage).state) {
+            // Utiliser lv_label_set_text au lieu de .set_text
+            lv_label_set_text(id(lbl_diag_allumage), "ALLUMAGE: ÉCHEC");
+            // id(...).obj est déjà un pointeur lv_obj_t*, pas besoin de .obj.obj
+            lv_obj_set_style_text_color(id(lbl_diag_allumage), lv_color_hex(0xC62828), 0);
+            // Fond page principale en Rouge
+            lv_obj_set_style_bg_color(id(main_page).obj, lv_color_hex(0xC62828), 0);
+          }
+          
+          // Si erreur de surchauffe active
+          if (id(err_surchauffe).state) {
+            lv_label_set_text(id(lbl_diag_surchauffe), "TEMPÉRATURE: SURCHAUFFE");
+            lv_obj_set_style_text_color(id(lbl_diag_surchauffe), lv_color_hex(0xC62828), 0);
+            // Fond page principale en Rouge
+            lv_obj_set_style_bg_color(id(main_page).obj, lv_color_hex(0xC62828), 0);
+          }
+
+      # --- Mise à jour des bouton Arrêt et Départ ---
+      - lambda: |-
+          static bool toggle = false;
+          toggle = !toggle;
+
+          // --- Mise à jour du bouton START ---
+          // Le BBQ est occupé si le ventilateur tourne, ou s'il est en phase d'allumage/refroidissement
+          bool is_busy = (id(fan_relay).state || id(is_igniting) || id(is_cooling));
+          
+          if (id(seq_depart).is_running()) {
+              // Effet clignotant pendant la séquence de départ
+              lv_obj_clear_state(id(btn_start), LV_STATE_DISABLED);
+              lv_obj_set_style_bg_color(id(btn_start), toggle ? lv_color_hex(0x5C925C) : lv_color_hex(0x005500), LV_PART_MAIN);
+          } else if (is_busy) {
+              lv_obj_add_state(id(btn_start), LV_STATE_DISABLED);
+              lv_obj_set_style_bg_color(id(btn_start), lv_color_hex(0x808080), LV_PART_MAIN);
+          } else {
+              lv_obj_clear_state(id(btn_start), LV_STATE_DISABLED);
+              lv_obj_set_style_bg_color(id(btn_start), lv_color_hex(0x2E7D32), LV_PART_MAIN); // Vert
+          }
+
+          // --- Mise à jour du bouton STOP ---
+          // On peut arrêter le BBQ seulement si le ventilateur est en marche
+          bool can_stop = (id(fan_relay).state);
+          
+          if (id(seq_arret).is_running()) {
+              // Effet clignotant pendant la séquence d'arrêt
+              lv_obj_clear_state(id(btn_stop), LV_STATE_DISABLED);
+              lv_obj_set_style_bg_color(id(btn_stop), toggle ? lv_color_hex(0xFF0000) : lv_color_hex(0x550000), LV_PART_MAIN);
+              // Texte selon la phase : pré-refroidissement (->225°F) ou refroidissement final
+              if (id(pre_cooldown_active)) {
+                  lv_label_set_text(id(lbl_stop_text), "REFROID.\n->225F");
+              } else {
+                  lv_label_set_text(id(lbl_stop_text), "ARRÊT\nEN COURS");
+              }
+          } else if (!can_stop) {
+              lv_obj_add_state(id(btn_stop), LV_STATE_DISABLED);
+              lv_obj_set_style_bg_color(id(btn_stop), lv_color_hex(0x808080), LV_PART_MAIN);
+              lv_label_set_text(id(lbl_stop_text), "ARRÊT");
+          } else {
+              lv_obj_clear_state(id(btn_stop), LV_STATE_DISABLED);
+              lv_obj_set_style_bg_color(id(btn_stop), lv_color_hex(0xC62828), LV_PART_MAIN); // Rouge
+              lv_label_set_text(id(lbl_stop_text), "ARRÊT");
+          }
+
+      # --- Mise à jour du bouton AMORÇAGE ---
+      # Grisé pendant is_cooling ET pre_cooldown_active : la purge d'urgence
+      # de la vis se fait maintenant via le bouton PURGE VIS dédié (allumeur
+      # + ventilateur automatiques), donc plus besoin que ce bouton reste
+      # actif pendant l'arrêt.
+      - lambda: |-
+          bool can_prime = (!id(safety_shutdown) && !id(pre_cooldown_active) && !id(is_cooling));
+          if (!can_prime) {
+            lv_obj_add_state(id(btn_prime), LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(id(btn_prime), lv_color_hex(0x808080), LV_PART_MAIN);
+          } else {
+            lv_obj_clear_state(id(btn_prime), LV_STATE_DISABLED);
+            if (!id(is_priming) && !id(manual_prime_active)) {
+              lv_obj_set_style_bg_color(id(btn_prime), lv_color_hex(0x1877F2), LV_PART_MAIN);
+            }
+          }
+
+      # --- Mise à jour du bouton PURGE VIS ---
+      # Désactivé pendant l'allumage, la régulation (HEAT) ou un arrêt
+      # d'urgence. Reste actif à l'arrêt complet ET pendant is_cooling.
+      # Toujours cliquable si une purge est en cours (pour l'arrêter).
+      - lambda: |-
+          bool can_purge = (!id(safety_shutdown) && !id(is_igniting) &&
+                             id(bbq_pid).mode != climate::CLIMATE_MODE_HEAT);
+          if (!can_purge && !id(purge_active)) {
+            lv_obj_add_state(id(btn_purge), LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(id(btn_purge), lv_color_hex(0x808080), LV_PART_MAIN);
+          } else {
+            lv_obj_clear_state(id(btn_purge), LV_STATE_DISABLED);
+            if (!id(purge_active)) {
+              lv_obj_set_style_bg_color(id(btn_purge), lv_color_hex(0x1877F2), LV_PART_MAIN);
+            }
+          }
+
+      # --- Mise à jour du bouton FUMÉE ---
+      - lambda: |-
+          // Désactivé si : Refroidissement OU (Ventilateur Off ET mode fumée pas déjà actif)
+          bool can_smoke = !id(is_cooling) && (id(fan_relay).state || id(smoke_mode_active));
+          
+          if (!can_smoke) {
+            lv_obj_add_state(id(btn_smoke_toggle), LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(id(btn_smoke_toggle), lv_color_hex(0x808080), LV_PART_MAIN);
+          } else {
+            lv_obj_clear_state(id(btn_smoke_toggle), LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(id(btn_smoke_toggle), lv_color_hex(0x607D8B), LV_PART_MAIN);
+          }
+
+      # --- SÉCURITÉ : FORCE LE PID À OFF SI LE VENTILATEUR S'ARRÊTE ---
+      - if:
+          condition:
+            # Si le ventilateur est ARRÊTÉ
+            lambda: 'return !id(fan_relay).state;'
+          then:
+            - if:
+                condition:
+                  # ET que le PID est encore en mode HEAT (Régulation)
+                  lambda: 'return id(bbq_pid).mode == climate::CLIMATE_MODE_HEAT;'
+                then:
+                  - climate.control:
+                      id: bbq_pid
+                      mode: "OFF"
+                  - logger.log: "Sécurité : PID forcé à OFF car le ventilateur est arrêté."
+
+      # Erreur de surchauffe page diag et HA
+      - if:
+          condition:
+            lambda: 'return id(bbq_temp_pv).state > 600.0;'
+          then:
+            - binary_sensor.template.publish: {id: err_surchauffe, state: ON}
+
+
+      # --- LOGIQUE D'AFFICHAGE DU MODE ACTUEL (Mise à jour) ---
+      - lvgl.label.update:
+          id: lbl_mode
+          text: !lambda |-
+            if (id(purge_active)) return "Mode: Purge Vis";
+            if (id(pre_cooldown_active)) return "Mode: Pré-refroid. (->225F)";
+            if (id(is_cooling)) return "Mode: Refroidissement";
+            if (id(is_igniting)) return "Mode: Allumage";
+            if (id(smoke_mode_active)) return "Mode: Fumée (MAN)";
+            if (id(bbq_pid).mode == climate::CLIMATE_MODE_HEAT) return "Mode: Régulation";
+            // Si rien ne tourne, on affiche bien Veille
+            return "Mode: Veille";
+
+      # --- Logique pour que la cible du bbq_pid suivi son PV si on est en mode fumée (min de 150)
+      - lambda: |-
+          if (id(smoke_mode_active)) {
+            float current_pv = id(bbq_temp_pv).state;
+          
+            // 1. Calcul de la cible (minimum selon var global smoke_temp_min
+            float new_target = (current_pv < id(smoke_temp_min)) ? id(smoke_temp_min) : current_pv;
+
+            // 2. Mise à jour de la cible du PID
+            auto call = id(bbq_pid).make_call();
+            call.set_target_temperature(new_target);
+            call.perform();
+
+            // 3. Synchronisation de l'affichage sur l'écran
+            lv_arc_set_value(id(arc_sp), (int)new_target);
+          }
+
+      # Remplisage orange de l'arc suit le (PV)
+      - lambda: |-
+          float pv_val = id(bbq_temp_pv).state;
+
+          // On vérifie que la valeur n'est pas "NaN" (sonde déconnectée)
+          if (!std::isnan(pv_val)) {
+            // Utilisation de la fonction LVGL correcte
+            lv_arc_set_value(id(arc_pv), (int)pv_val);
+          }
+
+
+  - interval: 5s
+    then:
+      # apparition d'un logo Pitboss qui change de place au seconde lorsque l'écran de veille est actif
+      - if:
+          condition:
+            switch.is_on: switch_antiburn
+          then:
+            - lambda: |-
+                // Limites : écran (1024x600) - taille image (250x200)
+                int max_x = 1024 - 250;
+                int max_y = 600 - 200;
+
+                // Génération de coordonnées aléatoires
+                id(logo_x) = rand() % max_x;
+                id(logo_y) = rand() % max_y;
+                
+            - lvgl.widget.update:
+                id: container_antiburn
+                x: !lambda "return id(logo_x);"
+                y: !lambda "return id(logo_y);"
+
+  - interval: 30s
+    then:
+      # Logique pour chauffage du boitier du contôleur
+      - if:
+          condition:
+            or:
+              - sensor.in_range: { id: temp_ext, below: 0.0 }
+              - sensor.in_range: { id: hum_ext, above: 80.0 }
+          then:
+            - switch.turn_on: ptc_heater
+          else:
+            - switch.turn_off: ptc_heater
+
+  - interval: 60s
+    then:
+      # Adaptation des paramètres de contrôle en fonction de la température extérieur
+      - lambda: |-
+          // ================================================================
+          // ADAPTATION DES COEFFICIENTS SELON LA TEMPÉRATURE EXTÉRIEURE
+          // ================================================================
+
+          // Si compensation désactivée → ratio figé à 1.0
+          if (!id(adapt_temp_ext_active)) {
+              id(ratio_ext_gel) = 1.0f;
+              auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+              if (!id(smith_active)) {
+                  // Conversion unités PROVOX → ESPHome
+                  pid_c->set_kp(id(base_kp) / id(plage_procede));
+                  pid_c->set_ki(id(base_ki) / (id(plage_procede) * 60.0f));
+                  pid_c->set_kd(0.0f);
+              }
+              id(smith_tau)   = id(tuner_smith_tau).state;
+              id(smith_theta) = id(tuner_smith_theta).state;
+              float new_max_i = id(pid_sortie_max) * 0.5f;
+              float new_min_i = -0.10f;
+              pid_c->set_max_integral(new_max_i);
+              pid_c->set_min_integral(new_min_i);
+              id(update_auger_routing).execute();
+              ESP_LOGD("ADAPT", "Compensation désactivée — ratio:1.0");
+              return;
+          }
+
+          // Condition "BBQ froid" : arrêté + ventilateur off + PV < 100°F
+          bool bbq_froid = (!id(fan_relay).state &&
+                            id(bbq_pid).mode == CLIMATE_MODE_OFF &&
+                            !id(is_cooling) &&
+                            id(bbq_temp_pv).state < 100.0f);
+
+          if (bbq_froid) {
+              float t_ext = id(temp_ext).state;
+              if (std::isnan(t_ext)) return;
+
+              // Interpolation linéaire conservative
+              // ratio=1.0 à 20°C, ratio=id(ratio_max_temp_ext) à -20°C
+              // pente = (id(ratio_max_temp_ext) / 40.0f) par °C
+              float ratio = 1.0f + (20.0f - t_ext) * ((id(ratio_max_temp_ext) - 1.0f) / 40.0f);
+
+              // Bornes de sécurité
+              if (ratio < 1.0f) ratio = 1.0f;   // Pas de réduction au dessus de 20°C
+              if (ratio > id(ratio_max_temp_ext)) ratio = id(ratio_max_temp_ext);   // Maximum à -20°C
+
+              id(ratio_ext_gel) = ratio;
+              ESP_LOGI("ADAPT", "BBQ froid — t_ext:%.1f°C ratio gelé: %.3f", t_ext, ratio);
+          }
+
+          // Application du ratio gelé
+          float ratio = id(ratio_ext_gel);
+          auto *pid_c = (pid::PIDClimate *)id(bbq_pid);
+
+          // Kp et Ki adaptés — Kd forcé à 0
+          float new_kp = ((id(base_kp) * ratio) / id(plage_procede));
+          float new_ki = ((id(base_ki) * ratio) / (id(plage_procede) * 60.0f));
+
+          if (!id(smith_active)) {
+              pid_c->set_kp(new_kp);
+              pid_c->set_ki(new_ki);
+              pid_c->set_kd(0.0f);
+          }
+
+          // Tau et theta fixes — pas de compensation pour l'instant
+          id(smith_tau)   = id(tuner_smith_tau).state;
+          id(smith_theta) = id(tuner_smith_theta).state;
+          float new_max_i = id(pid_sortie_max) * 0.5f;
+          float new_min_i = -0.10f;
+          pid_c->set_max_integral(new_max_i);
+          pid_c->set_min_integral(new_min_i);
+
+          id(update_auger_routing).execute();
+
+          ESP_LOGI("ADAPT", "ratio:%.3f | Kp:%.2f Ki:%.3f rép/min | Kp_natif:%.5f Ki_natif:%.6f | tau:%.0fs theta:%.0fs",
+                   ratio,
+                   id(base_kp) * ratio, id(base_ki) * ratio,
+                   (id(base_kp) * ratio) / id(plage_procede),
+                   (id(base_ki) * ratio) / (id(plage_procede) * 60.0f),
+                   id(smith_tau), id(smith_theta));
+
+################################################################################
+# Obtention du temps venant du serveur Home Assistant
+################################################################################
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    on_time_sync:
+      - script.execute: time_update
+    on_time:
+      - minutes: '*'
+        seconds: 0
+        then:
+          - script.execute: time_update
+          # Déclenche la mesure approximative
